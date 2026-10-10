@@ -1,0 +1,18 @@
+aoi:
+  default_crs: "EPSG:4326"
+  metric_crs: "EPSG:32645" # UTM 45N for Nepal
+  max_size_km2: 5000
+
+ingest:
+  s1_max_days_before: 15
+  s1_max_days_after: 15
+  s2_max_cloud_cover: 30
+
+flood_classical:
+  hand_threshold_m: 20
+  slope_threshold_deg: 15
+  vv_water_threshold_db: -18
+  vv_drop_db: 3
+
+damage:
+  buffer_m: 20

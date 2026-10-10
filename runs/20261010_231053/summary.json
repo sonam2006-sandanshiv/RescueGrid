@@ -1,0 +1,47 @@
+{
+  "run_id": "20261010_231053",
+  "event_name": "Bhote Koshi-Trishuli Glacial Flood 2026",
+  "aoi": "[85.8, 27.8, 86.0, 28.0]",
+  "flood_date": "2026-08-26",
+  "osm_date": "2026-07-27",
+  "flooded_km2": 0.0,
+  "debris_km2": 10.04,
+  "buildings_affected": 0,
+  "road_km_affected": 0.0,
+  "bridges_affected": 0,
+  "cutoff_count": 0,
+  "top_settlements": [
+    {
+      "name": "Dhulikhel Central",
+      "population": "nan",
+      "status": "reachable",
+      "pre_dist_m": 0,
+      "post_dist_m": 0
+    },
+    {
+      "name": "Tatopani Village",
+      "population": "1200",
+      "status": "reachable",
+      "pre_dist_m": 7874.27532266087,
+      "post_dist_m": 7874.27532266087
+    },
+    {
+      "name": "Larcha Settlement",
+      "population": "450",
+      "status": "reachable",
+      "pre_dist_m": 7874.1095869837745,
+      "post_dist_m": 7874.1095869837745
+    }
+  ],
+  "inputs": {
+    "s1_pre": "MOCK_S1_PRE",
+    "s1_post": "MOCK_S1_POST",
+    "s2_pre": null,
+    "s2_post": null,
+    "dem_tiles": [
+      "Copernicus_DSM_COG_10_N27_00_E086_00_DEM",
+      "Copernicus_DSM_COG_10_N27_00_E085_00_DEM"
+    ],
+    "osm_features_count": 8
+  }
+}

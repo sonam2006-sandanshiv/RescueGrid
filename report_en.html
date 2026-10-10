@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Situation Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 40px; font-size: 12px; }
+        h1 { color: #2c3e50; }
+        .header { display: flex; justify-content: space-between; border-bottom: 2px solid #2c3e50; padding-bottom: 10px; }
+        .stats { display: flex; justify-content: space-between; margin-top: 20px; }
+        .stat-box { background: #ecf0f1; padding: 10px; border-radius: 5px; width: 30%; text-align: center; }
+        .stat-value { font-size: 18px; font-weight: bold; color: #e74c3c; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+        th, td { border: 1px solid #bdc3c7; padding: 8px; text-align: left; }
+        th { background: #2c3e50; color: white; }
+        .footer { margin-top: 40px; font-size: 10px; color: #7f8c8d; border-top: 1px solid #bdc3c7; padding-top: 10px; }
+    </style>
+
+</head>
+<body>
+    <div class="header">
+        <h1>Flood Situation Report: Test Flood</h1>
+        <div>
+            <p><strong>Date:</strong> 2026-08-26</p>
+            <p><strong>AOI:</strong> 85.0,27.8,85.5,28.3</p>
+        </div>
+    </div>
+    
+    <h2>Headline Statistics</h2>
+    <div class="stats">
+        <div class="stat-box">
+            <p>Flooded Area</p>
+            <div class="stat-value">15.2 km²</div>
+        </div>
+        <div class="stat-box">
+            <p>Debris/Mud Area</p>
+            <div class="stat-value">5.1 km²</div>
+        </div>
+        <div class="stat-box">
+            <p>Buildings Affected</p>
+            <div class="stat-value">42</div>
+        </div>
+    </div>
+    
+    <div class="stats">
+        <div class="stat-box">
+            <p>Road Cut</p>
+            <div class="stat-value">8.5 km</div>
+        </div>
+        <div class="stat-box">
+            <p>Bridges Affected</p>
+            <div class="stat-value">2</div>
+        </div>
+        <div class="stat-box">
+            <p>Cut-off Settlements</p>
+            <div class="stat-value">3</div>
+        </div>
+    </div>
+    
+    <h2>Top Priority Cut-off Settlements</h2>
+    <table>
+        <tr><th>Settlement Name</th><th>Population (OSM)</th><th>Pre-Event Dist to Town/Hosp</th><th>Status</th></tr>
+        <tr><td>Village A</td><td>500</td><td>10.5 km</td><td>cut off</td></tr>
+
+    </table>
+    
+    <h2>Data Sources</h2>
+    <p>Sentinel-1 (Pre: S1_PRE_ID, Post: S1_POST_ID), Sentinel-2, Copernicus DEM GLO-30, OpenStreetMap (2026-07-27).</p>
+    
+    <div class="footer">
+        <p><strong>Educational prototype, not an operational tool.</strong></p>
+        <p>Contains modified Copernicus Sentinel data 2026. Produced using Copernicus WorldDEM-30 © DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH 2014–2018 provided under COPERNICUS by the European Union and ESA. © OpenStreetMap contributors.</p>
+    </div>
+</body>
+</html>
