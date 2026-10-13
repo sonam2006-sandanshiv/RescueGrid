@@ -1,575 +1,564 @@
-"""
-FloodLens AI — Track B Dashboard
-Location-first workflow: search → AOI draw → run pipeline → display results.
-All displayed numbers come from the pipeline's summary.json artefact.
-Educational prototype, not an operational tool.
-"""
+"""Fast, single-screen rescue workflow for satellite scene discovery."""
+from __future__ import annotations
 
-import sys
+import os
 import json
-import glob
-import logging
+import hashlib
+import copy
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from typing import Any
+from urllib.parse import urlencode
 
+import folium
+import planetary_computer as pc
 import requests
 import streamlit as st
-import folium
-from folium.plugins import Draw, MeasureControl
+from dotenv import load_dotenv
 from streamlit_folium import st_folium
-import pandas as pd
+import streamlit.components.v1 as components
 
-# ── repo root on path ────────────────────────────────────────────────────────
-REPO_ROOT = Path(__file__).resolve().parent.parent
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+load_dotenv(PROJECT_ROOT / ".env")
 
-from src.pipeline import run as run_pipeline
-from src.report.sitrep import copilot_qa
+from src.analysis import analyze_event
 from src.ingest.s1 import search_s1
 from src.ingest.s2 import search_s2
+from src.ingest.osm import fetch_osm_layers
+from src.navigation import get_routes
+from shapely.geometry import mapping, shape
 
-logging.basicConfig(level=logging.WARNING)
+st.set_page_config(page_title="Himalayan Flood Mapper", page_icon="🛰️", layout="wide")
 
-# ── page config ──────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="FloodLens AI — Flood Damage from Space",
-    page_icon="🛰️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# ── CSS ───────────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap');
-html, body, [data-testid="stApp"] {
-    font-family: 'Inter', sans-serif;
-    background: #0b0f19;
-    color: #e2e8f0;
-}
-[data-testid="stSidebar"] { background: #111827; border-right: 1px solid #1e293b; }
-.hero { padding: 0.5rem 0 1rem; }
-.hero h1 {
-    font-size: 2.2rem; font-weight: 800;
-    background: linear-gradient(90deg,#38bdf8,#818cf8);
-    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    margin-bottom: 0.2rem;
-}
-.hero p { color: #94a3b8; font-size: 0.95rem; margin: 0; }
-.kpi-grid { display: flex; gap: 12px; margin-bottom: 1rem; flex-wrap: wrap; }
-.kpi { background: #1e293b; border-radius: 10px; padding: 14px 18px;
-       flex: 1; min-width: 130px; border-top: 3px solid #38bdf8; }
-.kpi.red  { border-top-color: #f43f5e; }
-.kpi.amber{ border-top-color: #f59e0b; }
-.kpi.green{ border-top-color: #22c55e; }
-.kpi .label { font-size: 0.72rem; text-transform: uppercase; letter-spacing:.05em; color:#94a3b8; }
-.kpi .val   { font-size: 1.7rem; font-weight: 700; color: #f1f5f9; line-height: 1.1; }
-.kpi .unit  { font-size: 0.85rem; color: #94a3b8; }
-.step { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-.step .badge {
-    background:#1e40af; color:#bfdbfe; border-radius:50%; width:26px; height:26px;
-    display:flex; align-items:center; justify-content:center;
-    font-size:0.78rem; font-weight:700; flex-shrink:0;
-}
-.step.done .badge { background:#14532d; color:#86efac; }
-.step.active .badge { background:#7c3aed; color:#ddd6fe; }
-hr.divider { border: none; border-top: 1px solid #1e293b; margin: 1rem 0; }
-.attr { font-size: 0.68rem; color: #475569; margin-top: 1rem; line-height: 1.5; }
-</style>
-""", unsafe_allow_html=True)
-
-# ── session-state defaults ────────────────────────────────────────────────────
-for k, v in {
-    "step": 1,            # wizard step 1-4
-    "aoi_bbox": None,     # [minx,miny,maxx,maxy]
-    "place_name": "",
-    "flood_date": "2026-08-26",
-    "osm_date": "2026-07-27",
-    "map_center": [27.90, 85.90],
-    "map_zoom": 9,
-    "geocode_results": [],
-    "scene_summary": None,
-    "latest_summary_path": None,
-    "summary_data": {},
-    "run_log": [],
-}.items():
-    if k not in st.session_state:
-        st.session_state[k] = v
-
-# ── helpers ───────────────────────────────────────────────────────────────────
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
+GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
+RUNS_DIR = PROJECT_ROOT / "runs"
 
-def geocode(query: str) -> list[dict]:
-    """Return list of {name, lat, lon, bbox_deg} from Nominatim."""
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def geocode(query: str) -> dict[str, Any] | None:
+    parts = query.split(",")
+    if len(parts) == 2:
+        try:
+            lat, lon = map(float, parts)
+            if -90 <= lat <= 90 and -180 <= lon <= 180:
+                return {"name": f"{lat:.5f}, {lon:.5f}", "lat": lat, "lon": lon}
+        except ValueError:
+            pass
+    response = requests.get(NOMINATIM, params={"q": query, "format": "jsonv2", "limit": 1},
+                            headers={"User-Agent": "HimalayanFloodMapper/1.0 (rescue mapping prototype)"}, timeout=8)
+    response.raise_for_status()
+    results = response.json()
+    if not results:
+        return None
+    item = results[0]
+    return {"name": item["display_name"], "lat": float(item["lat"]), "lon": float(item["lon"])}
+
+
+def query_sensor(sensor: str, bbox: tuple[float, float, float, float], event: date,
+                 before: date, after: date, window_days: int):
+    if sensor == "Sentinel-1":
+        return search_s1(bbox, event.isoformat(), max_days_before=window_days, max_days_after=window_days,
+                         before_target=before.isoformat(), after_target=after.isoformat())
+    return search_s2(bbox, event.isoformat(), max_days_before=window_days, max_days_after=window_days,
+                     max_cloud_cover=100, before_target=before.isoformat(), after_target=after.isoformat())
+
+def aoi_bbox(lat: float, lon: float, radius_km: float) -> tuple[float, float, float, float]:
+    """WGS84 bbox for a km radius; longitude width accounts for latitude."""
+    import math
+    lat_delta = radius_km / 111.32
+    lon_delta = radius_km / max(111.32 * abs(math.cos(math.radians(lat))), 1.0)
+    return (max(-180.0, lon-lon_delta), max(-90.0, lat-lat_delta),
+            min(180.0, lon+lon_delta), min(90.0, lat+lat_delta))
+
+
+def _item_dict(item: Any) -> dict[str, Any]:
+    if isinstance(item, dict):
+        return item
+    if hasattr(item, "to_dict"):
+        return item.to_dict()
+    raise TypeError(f"Unsupported STAC item: {type(item).__name__}")
+
+
+def item_summary(item: Any) -> dict[str, Any]:
+    item = _item_dict(item)
+    props = item.get("properties", {})
+    raw_date = props.get("datetime")
+    scene_date = datetime.fromisoformat(raw_date.replace("Z", "+00:00")).date().isoformat()
+    return {"id": item.get("id"), "date": scene_date,
+            "cloud_cover_percent": props.get("eo:cloud_cover"),
+            "orbit": props.get("sat:relative_orbit") or props.get(" sat:relative_orbit"),
+            "pass": props.get("sat:orbit_state"), "assets": item.get("assets", {})}
+
+
+def groq_copilot(report_data: dict[str, Any]) -> str:
+    """Ask Groq for wording only; all dates and quantities below come from local map data."""
+    api_key = os.environ.get("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Set GROQ_API_KEY in your environment to enable the report copilot.")
+    model = os.environ.get("GROQ_MODEL", DEFAULT_MODEL)
+    response = requests.post(GROQ_URL, headers={"Authorization": f"Bearer {api_key}"}, json={
+        "model": model, "temperature": 0.1, "reasoning_effort": "low", "max_completion_tokens": 220,
+        "messages": [{"role": "system", "content": (
+            "Return a JSON object with exactly two string keys: English and Nepali. Each value is one short, "
+            "careful sentence about candidate satellite changes needing field verification. Do not include "
+            "digits, dates, quantities, counts, location names, damage claims, or facts not provided. Do not "
+            "claim a flood is confirmed.")},
+                    {"role": "user", "content": "Write a concise rescue update about reviewing candidate satellite change signals in the map."}]}, timeout=20)
+    response.raise_for_status()
+    choice = response.json()["choices"][0]
+    content = choice.get("message", {}).get("content", "")
+    if choice.get("finish_reason") == "length":
+        raise RuntimeError("The report reached its small output limit. Use the verified map facts shown in the report.")
     try:
-        r = requests.get(
-            NOMINATIM,
-            params={"q": query, "format": "json", "limit": 5,
-                    "addressdetails": 0, "accept-language": "en"},
-            headers={"User-Agent": "FloodLensAI/1.0 (flood-hackathon-prototype)"},
-            timeout=8,
+        note = json.loads(content)
+        english, nepali = note.get("English", "").strip(), note.get("Nepali", "").strip()
+        if not english or not nepali or any(char.isdigit() for char in english + nepali):
+            raise ValueError("The wording did not meet the no-numbers requirement.")
+    except (TypeError, ValueError):
+        english = "Satellite imagery shows candidate changes that need field verification."
+        nepali = "उपग्रह तस्बिरमा देखिएका सम्भावित परिवर्तनलाई स्थलमै पुष्टि गर्नुपर्छ।"
+
+    lines = ["**Verified map facts**"]
+    for sensor, pair in report_data.get("catalog_scene_pairs", {}).items():
+        lines.append(f"- {sensor} scenes: {pair['before_date']} → {pair['after_date']}")
+    stats = report_data.get("system_analysis_stats")
+    if stats:
+        labels = (
+            ("candidate_flood_area_ha", "Candidate water", "ha"),
+            ("disturbed_bare_surface_candidate_area_ha", "Disturbed surface candidate", "ha"),
+            ("buildings_intersecting_candidate_water", "Buildings intersecting candidate water", ""),
+            ("bridges_intersecting_candidate_water", "Bridges intersecting candidate water", ""),
+            ("road_length_intersecting_candidate_water_km", "Road length intersecting candidate water", "km"),
+            ("settlements_disconnected_from_towns_or_healthcare", "Settlements disconnected from mapped towns/healthcare", ""),
         )
-        results = []
-        for d in r.json():
-            bb = d.get("boundingbox", [])
-            if len(bb) == 4:
-                s, n, w, e = [float(x) for x in bb]
-                results.append({
-                    "name": d.get("display_name", "")[:90],
-                    "lat": float(d["lat"]),
-                    "lon": float(d["lon"]),
-                    "bbox": [w, s, e, n],   # [minx, miny, maxx, maxy]
-                })
-        return results
-    except Exception as e:
-        return []
+        for key, label, unit in labels:
+            if key in stats:
+                value = "unknown" if stats[key] is None else str(stats[key])
+                lines.append(f"- {label}: {value}{(' ' + unit) if unit and value != 'unknown' else ''}")
+        lines.extend(f"- Map note: {warning}" for warning in stats.get("warnings", []))
+    if not report_data.get("catalog_scene_pairs") and not stats:
+        lines.append(f"- Event date: {report_data.get('event_date', 'unavailable')}")
+    return f"**English**\n\n{english}\n\n**नेपाली**\n\n{nepali}\n\n" + "\n".join(lines)
 
-def bbox_to_str(bb: list) -> str:
-    return f"{bb[0]:.5f},{bb[1]:.5f},{bb[2]:.5f},{bb[3]:.5f}"
 
-def expand_bbox(lat: float, lon: float, km: float = 25) -> list:
-    """Expand a point to a bbox of ±km kilometres."""
-    deg_lat = km / 111.0
-    deg_lon = km / (111.0 * abs(max(0.01, abs(lat))) ** 0.01 / 1)  # approx
-    deg_lon = km / (111.0 * max(0.01, abs(lat) or 1.0) ** 0.001)
-    deg_lon = km / 111.0  # simplified for mid-latitudes
-    return [lon - deg_lon, lat - deg_lat, lon + deg_lon, lat + deg_lat]
+def render_scene_card(sensor: str, label: str, item: dict[str, Any]) -> None:
+    summary = item_summary(item)
+    st.markdown(f"**{label} · {summary['date']}**")
+    st.caption(summary["id"] or "Scene ID unavailable")
+    if summary["cloud_cover_percent"] is not None:
+        st.caption(f"Cloud cover: {float(summary['cloud_cover_percent']):.0f}%")
+    if summary["orbit"] is not None:
+        st.caption(f"Relative orbit {summary['orbit']} · {summary['pass'] or 'pass unavailable'}")
+    assets = summary["assets"]
+    preview = next((assets[key].get("href") for key in ("thumbnail", "rendered_preview", "visual")
+                    if isinstance(assets.get(key), dict) and assets[key].get("href")), None)
+    if preview and any(key in assets for key in ("thumbnail", "rendered_preview")):
+        preview = pc.sign_url(preview)
+        st.image(preview, caption=f"{sensor} catalog preview — {label}", use_container_width=True)
+    hrefs = [(key, asset.get("href")) for key, asset in assets.items()
+             if isinstance(asset, dict) and asset.get("href")]
+    if hrefs:
+        with st.expander(f"{sensor} source assets"):
+            for key, href in hrefs[:10]:
+                st.markdown(f"[{key}]({href})")
 
-def load_latest_summary():
-    """Find the most recent runs/*/summary.json relative to REPO_ROOT."""
-    pattern = str(REPO_ROOT / "runs" / "*" / "summary.json")
-    files = sorted(glob.glob(pattern), reverse=True)
-    if files:
-        p = files[0]
-        with open(p, encoding="utf-8") as f:
-            return p, json.load(f)
-    return None, {}
 
-def fetch_scene_preview(bbox, flood_date):
-    """Query MPC for available S1/S2 scenes and return a summary dict."""
+def metric_text(value: Any, suffix: str = "") -> str:
+    return "N/A" if value is None else f"{value:,}{suffix}"
+
+
+def affected_area_records(flood_data: dict[str, Any], settlement_path: Path,
+                          fallback_name: str) -> list[dict[str, Any]]:
+    """Build candidate-water component coordinates with nearby OSM place names when available."""
+    settlements = []
     try:
-        s1 = search_s1(bbox, flood_date, max_days_before=20, max_days_after=20)
-        s2 = search_s2(bbox, flood_date)
-        return {
-            "s1_found": bool(s1),
-            "s1_pre": s1[0].id if s1 else None,
-            "s1_post": s1[1].id if s1 else None,
-            "s1_orbit": s1[0].properties.get("sat:relative_orbit") if s1 else None,
-            "s2_found": bool(s2),
-            "s2_pre": s2[0].id if s2 else None,
-            "s2_post": s2[1].id if s2 else None,
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        data = json.loads(settlement_path.read_text(encoding="utf-8"))
+        for feature in data.get("features", []):
+            if feature.get("geometry"):
+                geom = shape(feature["geometry"])
+                props = feature.get("properties", {})
+                name = props.get("name") or props.get("name:en") or props.get("name:ne")
+                if name:
+                    settlements.append((name, geom))
+    except (OSError, ValueError, TypeError):
+        pass
 
-# ── header ────────────────────────────────────────────────────────────────────
-st.markdown("""
-<div class="hero">
-  <h1>🛰️ FloodLens AI</h1>
-  <p>Track B · Mapping Flood Damage from Space · Sentinel-1/2 + OSM · Educational prototype</p>
-</div>
-""", unsafe_allow_html=True)
-
-# ── sidebar wizard ─────────────────────────────────────────────────────────────
-def sidebar_step_badge(n, label, state):
-    cls = "done" if state == "done" else ("active" if state == "active" else "step")
-    icon = "✓" if state == "done" else str(n)
-    st.sidebar.markdown(
-        f'<div class="step {cls}"><div class="badge">{icon}</div><span>{label}</span></div>',
-        unsafe_allow_html=True,
-    )
-
-with st.sidebar:
-    st.markdown("### 📍 Analysis Wizard")
-    sidebar_step_badge(1, "Search location", "done" if st.session_state.step > 1 else "active")
-    sidebar_step_badge(2, "Set AOI & dates", "done" if st.session_state.step > 2 else ("active" if st.session_state.step == 2 else "step"))
-    sidebar_step_badge(3, "Preview scenes", "done" if st.session_state.step > 3 else ("active" if st.session_state.step == 3 else "step"))
-    sidebar_step_badge(4, "Run & view results", "active" if st.session_state.step == 4 else "step")
-
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-
-    # ── Step 1: Location Search ───────────────────────────────────────────────
-    st.markdown("**Step 1 · Location Search**")
-    query = st.text_input("Place / river / district", value="Bhote Koshi Trishuli Nepal",
-                          placeholder="e.g. Tatopani, Sindhupalchok…", key="location_query")
-    if st.button("🔍 Search", use_container_width=True):
-        with st.spinner("Geocoding…"):
-            st.session_state.geocode_results = geocode(query)
-        if not st.session_state.geocode_results:
-            st.warning("No results — try a broader name.")
-
-    if st.session_state.geocode_results:
-        choices = [r["name"][:70] for r in st.session_state.geocode_results]
-        sel_idx = st.selectbox("Select match:", range(len(choices)),
-                               format_func=lambda i: choices[i], key="geo_sel")
-        chosen = st.session_state.geocode_results[sel_idx]
-
-        radius_km = st.slider("Analysis radius (km)", 5, 100, 25, key="radius_km")
-        if st.button("📌 Use this location", use_container_width=True):
-            st.session_state.aoi_bbox = expand_bbox(chosen["lat"], chosen["lon"], radius_km)
-            st.session_state.place_name = chosen["name"][:60]
-            st.session_state.map_center = [chosen["lat"], chosen["lon"]]
-            st.session_state.map_zoom = 10
-            st.session_state.step = 2
-            st.rerun()
-
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-
-    # ── Step 2: Dates & manual bbox ──────────────────────────────────────────
-    st.markdown("**Step 2 · Dates & AOI**")
-    flood_date_input = st.date_input(
-        "Flood event date", value=date.fromisoformat(st.session_state.flood_date),
-        min_value=date(2014, 1, 1), max_value=date.today(), key="fd"
-    )
-    osm_date_input = st.date_input(
-        "OSM snapshot (pre-event)", value=date.fromisoformat(st.session_state.osm_date),
-        min_value=date(2014, 1, 1), max_value=date.today(), key="od"
-    )
-    if osm_date_input >= flood_date_input:
-        st.error("OSM date must be BEFORE flood date.")
-    else:
-        st.session_state.flood_date = flood_date_input.isoformat()
-        st.session_state.osm_date = osm_date_input.isoformat()
-
-    bbox_manual = st.text_input(
-        "Override bbox (minX,minY,maxX,maxY)",
-        value=bbox_to_str(st.session_state.aoi_bbox) if st.session_state.aoi_bbox else "85.80,27.80,86.00,28.00",
-        key="bbox_manual"
-    )
-    if st.button("Apply manual bbox", use_container_width=False):
+    areas = []
+    for feature in flood_data.get("features", []):
         try:
-            parts = [float(x.strip()) for x in bbox_manual.split(",")]
-            assert len(parts) == 4
-            st.session_state.aoi_bbox = parts
-            st.session_state.step = max(st.session_state.step, 2)
-            st.rerun()
-        except Exception:
-            st.error("Bad bbox format. Use: minX,minY,maxX,maxY")
+            geom = shape(feature["geometry"])
+            parts = list(geom.geoms) if geom.geom_type == "MultiPolygon" else [geom]
+            for part in parts:
+                if part.geom_type != "Polygon" or part.is_empty:
+                    continue
+                point = part.representative_point()
+                closest = min(settlements, key=lambda row: row[1].distance(point), default=None)
+                place = closest[0] if closest and closest[1].distance(point) <= 0.1 else None
+                if not place and fallback_name and not any(char.isdigit() for char in fallback_name[:8]):
+                    place = fallback_name.split(",")[0].strip()
+                index = len(areas) + 1
+                name = f"{place} · candidate water area {index}" if place else f"Candidate water area {index}"
+                areas.append({"name": name, "latitude": float(point.y), "longitude": float(point.x)})
+        except (KeyError, TypeError, ValueError):
+            continue
+    return areas[:20]
 
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
 
-    # ── Step 3: Preview scenes ────────────────────────────────────────────────
-    st.markdown("**Step 3 · Preview Satellite Scenes**")
-    if st.session_state.aoi_bbox and st.button("🛰 Check available scenes", use_container_width=True):
-        with st.spinner("Querying Microsoft Planetary Computer…"):
-            bb = st.session_state.aoi_bbox
-            st.session_state.scene_summary = fetch_scene_preview(bb, st.session_state.flood_date)
-        st.session_state.step = max(st.session_state.step, 3)
-        st.rerun()
+st.title("🛰️ Himalayan Flood Mapper")
+st.caption("Search a place and event date. Compare Sentinel-1/2 before-and-after scenes and map candidate water, disturbed surfaces, and exposed access routes.")
 
-    sc = st.session_state.scene_summary
-    if sc:
-        if "error" in sc:
-            st.warning(f"Scene query: {sc['error']}")
-        else:
-            st.success("✅ S1 pair found" if sc["s1_found"] else "⚠️ No S1 pair (will use mock)")
-            if sc["s1_found"]:
-                st.caption(f"Pre: `{(sc['s1_pre'] or '')[:30]}…`")
-                st.caption(f"Post: `{(sc['s1_post'] or '')[:30]}…`")
-                st.caption(f"Orbit: `{sc.get('s1_orbit', 'N/A')}`")
-            st.info("✅ S2 pair found" if sc["s2_found"] else "ℹ️ S2 unavailable (S1-only mode)")
+with st.form("rescue_search"):
+    saved_search = st.session_state.get("search_result")
+    default_location = (f"{saved_search['location']['lat']:.5f}, {saved_search['location']['lon']:.5f}"
+                        if saved_search else "")
+    default_event = date.fromisoformat(saved_search["event_date"]) if saved_search else date.today()
+    top = st.columns([4, 1, 1, 1])
+    place = top[0].text_input("Location", value=default_location,
+                              placeholder="Search a village, town, or latitude, longitude", key="search_location")
+    event_date = top[1].date_input("Flood date", value=default_event, key="search_event_date")
+    window_days = top[2].number_input("Search window (days)", min_value=7, max_value=180, value=48, step=7)
+    radius_km = top[3].number_input("AOI radius (km)", min_value=0.5, max_value=30.0, value=2.0, step=0.5)
+    targets = st.columns(2)
+    before_target = targets[0].date_input("Preferred pre-flood date", value=event_date - __import__("datetime").timedelta(days=12))
+    after_target = targets[1].date_input("Preferred post-flood date", value=event_date + __import__("datetime").timedelta(days=12))
+    submit = st.form_submit_button("Find satellite scenes", type="primary", use_container_width=True)
 
-    st.markdown('<hr class="divider">', unsafe_allow_html=True)
-
-    # ── Step 4: Run ───────────────────────────────────────────────────────────
-    st.markdown("**Step 4 · Run Full Analysis**")
-    engine = st.selectbox("Detection engine",
-                          ["Classical S1 + DEM HAND", "Fused S1+S2 Ensemble", "AI U-Net (offline mock)"],
-                          key="engine_sel")
-    run_btn = st.button("🚀 Execute Pipeline", use_container_width=True,
-                        disabled=st.session_state.aoi_bbox is None)
-
-if run_btn:
-    bbox = st.session_state.aoi_bbox
-    fdate = st.session_state.flood_date
-    odate = st.session_state.osm_date
-    with st.spinner("Running end-to-end pipeline… (30–120 s for real STAC queries)"):
+if submit:
+    if not place.strip():
+        st.error("Enter a location to search.")
+    elif not before_target < event_date < after_target:
+        st.error("Choose a pre-flood date before the event and a post-flood date after it.")
+    elif (event_date-before_target).days > int(window_days) or (after_target-event_date).days > int(window_days):
+        st.error("Preferred scene dates must fall inside the configured search window. Widen the window or move the preferred dates.")
+    else:
         try:
-            summary_path = run_pipeline(bbox, fdate, odate)
-            st.session_state.latest_summary_path = str(summary_path)
-            _, sd = load_latest_summary()
-            st.session_state.summary_data = sd
-            st.session_state.step = 4
-            st.session_state.run_log.append(
-                f"{datetime.now().strftime('%H:%M:%S')} — Run complete → {summary_path}"
-            )
-        except Exception as e:
-            st.error(f"Pipeline error: {e}")
+            with st.spinner("Finding location and Sentinel scenes independently…"):
+                location = geocode(place.strip())
+                if location is None:
+                    st.error("No matching place found. Try a nearby town or a latitude, longitude pair.")
+                    st.stop()
+                bbox = aoi_bbox(location["lat"], location["lon"], float(radius_km))
+                found, errors = {}, {}
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    futures = {sensor: pool.submit(query_sensor, sensor, bbox, event_date, before_target,
+                                                  after_target, int(window_days))
+                               for sensor in ("Sentinel-1", "Sentinel-2")}
+                    for sensor, future in futures.items():
+                        try:
+                            found[sensor] = future.result()
+                            if not found[sensor]:
+                                errors[sensor] = f"No real pre/post pair found within ±{int(window_days)} days. Widen the window or try another AOI."
+                        except Exception as exc:
+                            found[sensor] = None
+                            errors[sensor] = f"Catalog search failed: {exc}"
+                paired = {sensor: pair for sensor, pair in found.items() if pair and len(pair) == 2}
+                for sensor in ("Sentinel-1", "Sentinel-2"):
+                    st.session_state[f"accept_{sensor}"] = False
+                st.session_state["search_result"] = {"location": location, "bbox": bbox,
+                    "event_date": event_date.isoformat(), "before_target": before_target.isoformat(),
+                    "after_target": after_target.isoformat(), "window_days": int(window_days),
+                    "radius_km": float(radius_km), "found": found, "paired": paired, "errors": errors}
+                st.session_state.pop("analysis_result", None)
+                st.session_state.pop("route_result", None)
+        except requests.RequestException as exc:
+            st.error(f"Location search service unavailable: {exc}")
+        except Exception as exc:
+            st.error(f"Location or catalog search could not complete: {exc}")
 
-# load last completed run even without clicking Run
-if not st.session_state.summary_data:
-    p, sd = load_latest_summary()
-    if sd:
-        st.session_state.latest_summary_path = p
-        st.session_state.summary_data = sd
+result = st.session_state.get("search_result")
+if result:
+    loc = result["location"]
+    event_day = date.fromisoformat(result["event_date"])
+    snapshot = date.fromordinal(event_day.toordinal()-1)
+    st.subheader(loc["name"])
+    st.caption(f"Event date: {result['event_date']} · preferred scenes {result['before_target']} / {result['after_target']} · ±{result['window_days']} days · AOI radius {result['radius_km']} km")
+    map_col, data_col = st.columns([1, 2])
+    with map_col:
+        fmap = folium.Map(location=[loc["lat"], loc["lon"]], zoom_start=11, tiles="OpenStreetMap")
+        folium.Marker([loc["lat"], loc["lon"]], tooltip=loc["name"], icon=folium.Icon(color="red", icon="crosshairs", prefix="fa")).add_to(fmap)
+        folium.Rectangle(bounds=[[result["bbox"][1], result["bbox"][0]], [result["bbox"][3], result["bbox"][2]]],
+                         color="#f97316", fill=True, fill_opacity=.08, tooltip="Selected AOI · WGS84").add_to(fmap)
+        st_folium(fmap, height=330, width=700, returned_objects=[])
+    with data_col:
+        for sensor in ("Sentinel-1", "Sentinel-2"):
+            st.markdown(f"#### {sensor} · nearest pre/post scenes")
+            if sensor in result["paired"]:
+                left, right = st.columns(2)
+                with left:
+                    render_scene_card(sensor, "BEFORE", result["paired"][sensor][0])
+                with right:
+                    render_scene_card(sensor, "AFTER", result["paired"][sensor][1])
+                before, after = item_summary(result["paired"][sensor][0]), item_summary(result["paired"][sensor][1])
+                if before["date"] != result["before_target"] or after["date"] != result["after_target"]:
+                    accepted = st.checkbox(f"Accept these nearest real {sensor} dates ({before['date']} / {after['date']})",
+                                           key=f"accept_{sensor}", value=False)
+                    if not accepted:
+                        st.warning("Alternative dates need your acceptance before analysis.")
+                else:
+                    st.checkbox(f"Confirm selected {sensor} scenes", key=f"accept_{sensor}", value=True, disabled=True)
+            else:
+                st.warning(result["errors"].get(sensor, "No scenes found in this search window."))
 
-sd = st.session_state.summary_data
+    accepted_pairs = {sensor: pair for sensor, pair in result["paired"].items()
+                      if st.session_state.get(f"accept_{sensor}", False)}
+    if not st.session_state.get("analysis_result"):
+        st.caption("Change polygons are candidate detections. Review the acquired dates and accept nearest-date alternatives before analysis.")
+    if st.button("Analyze accepted imagery and map exposure", type="primary", disabled=not accepted_pairs):
+        cache_identity = {"date": result["event_date"], "bbox": result["bbox"],
+                          "scenes": {sensor: [item_summary(item)["id"] for item in pair]
+                                     for sensor, pair in accepted_pairs.items()}}
+        cache_key = hashlib.sha1(json.dumps(cache_identity, sort_keys=True).encode()).hexdigest()[:12]
+        run_dir = RUNS_DIR / f"event-{result['event_date']}-{cache_key}"
+        try:
+            cached_path = run_dir / "analysis.json"
+            stats = json.loads(cached_path.read_text(encoding="utf-8")) if cached_path.exists() else None
+            cache_has_osm = bool(stats and stats.get("osm_feature_counts"))
+            needs_analysis = stats is None or (os.environ.get("OHSOME_API_KEY", "").strip() and not cache_has_osm)
+            if needs_analysis:
+                osm_layers = {}
+                if os.environ.get("OHSOME_API_KEY", "").strip():
+                    try:
+                        with st.spinner("Loading pre-event roads, buildings, bridges, and settlements…"):
+                            osm_layers = fetch_osm_layers(tuple(result["bbox"]), snapshot,
+                                                          date.fromisoformat(result["event_date"]), timeout=35)
+                    except Exception as osm_exc:
+                        st.warning(f"Pre-event OSM snapshot unavailable: {osm_exc}. Exposure and access will remain unknown.")
+                with st.spinner("Downloading selected raster bands and mapping candidate change…"):
+                    paired_items = {sensor: tuple(_item_dict(item) for item in pair)
+                                    for sensor, pair in accepted_pairs.items()}
+                    stats = analyze_event(paired_items, result["bbox"], osm_layers, run_dir)
+            st.session_state["analysis_result"] = {"stats": stats, "run_dir": str(run_dir)}
+        except Exception as exc:
+            st.error(f"Satellite and map analysis could not complete: {exc}")
 
-# ── KPI row ───────────────────────────────────────────────────────────────────
-def kpi(label, val, unit="", css=""):
-    return f"""<div class="kpi {css}">
-        <div class="label">{label}</div>
-        <div class="val">{val}<span class="unit"> {unit}</span></div>
-    </div>"""
+    analysis_result = st.session_state.get("analysis_result")
+    if analysis_result:
+        stats = analysis_result["stats"]
+        run_dir = Path(analysis_result["run_dir"])
+        st.markdown("### Event analysis")
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Candidate water", metric_text(stats["candidate_flood_area_ha"], " ha"))
+        metric_cols[1].metric("Disturbed surface", metric_text(stats["disturbed_bare_surface_candidate_area_ha"], " ha"))
+        metric_cols[2].metric("Buildings / bridges exposed", f"{metric_text(stats['buildings_intersecting_candidate_water'])} / {metric_text(stats['bridges_intersecting_candidate_water'])}")
+        metric_cols[3].metric("Road length exposed", metric_text(stats["road_length_intersecting_candidate_water_km"], " km"))
+        metric_cols[4].metric("Settlements disconnected", metric_text(stats["settlements_disconnected_from_towns_or_healthcare"]))
+        candidate_location = stats.get("candidate_water_location")
+        if candidate_location:
+            st.info(f"Candidate water centroid: {candidate_location['latitude']:.6f}, {candidate_location['longitude']:.6f} · "
+                    f"{stats['candidate_flood_area_ha']:.2f} ha · sensor support: {stats.get('candidate_water_sensor_support', 'unknown')} · "
+                    f"area-only screening severity: {stats.get('candidate_water_severity_estimate', 'unknown')} · suspected, not field verified")
+        st.caption(f"Analyzed: {', '.join(stats['sensors_analyzed'])} · {stats['pixel_resolution_m']} m grid · OSM snapshot {snapshot.isoformat()}")
+        for warning in stats["warnings"]:
+            st.warning(warning)
 
-st.markdown('<div class="kpi-grid">' +
-    kpi("Flooded Area",         sd.get("flooded_km2", "—"),    "km²",  "red") +
-    kpi("Debris Area",          sd.get("debris_km2", "—"),     "km²",  "amber") +
-    kpi("Buildings Affected",   sd.get("buildings_affected","—"),     "",     "red") +
-    kpi("Road Damage",          sd.get("road_km_affected","—"), "km",  "amber") +
-    kpi("Bridges Affected",     sd.get("bridges_affected","—"),       "",     "red") +
-    kpi("Cut-off Settlements",  sd.get("cutoff_count", "—"),          "",     "red") +
-'</div>', unsafe_allow_html=True)
+        flood_path = run_dir / "flood_candidates.geojson"
+        flood_data = {"type": "FeatureCollection", "features": []}
+        if flood_path.exists():
+            try:
+                flood_data = json.loads(flood_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                st.warning("Candidate-water geometry could not be read; affected-area coordinates are unavailable.")
+        affected_areas = affected_area_records(
+            flood_data, run_dir / "nearby_settlements.geojson", loc.get("name", ""))
 
-# ── tabs ──────────────────────────────────────────────────────────────────────
-tab_map, tab_infra, tab_cutoff, tab_copilot, tab_reports, tab_provenance = st.tabs([
-    "🗺️ Flood Map", "🏗️ Infrastructure", "🚧 Cut-off Settlements",
-    "🤖 Rescue Copilot", "📄 Reports", "🔍 Data Provenance"
-])
-
-# ── helpers for AOI centre ────────────────────────────────────────────────────
-def map_center():
-    if st.session_state.aoi_bbox:
-        bb = st.session_state.aoi_bbox
-        return [(bb[1]+bb[3])/2, (bb[0]+bb[2])/2]
-    return st.session_state.map_center
-
-def map_zoom():
-    return st.session_state.map_zoom
-
-# ── Tab 1: Flood map ──────────────────────────────────────────────────────────
-with tab_map:
-    col_map, col_legend = st.columns([3, 1])
-    with col_map:
-        m = folium.Map(location=map_center(), zoom_start=map_zoom(),
-                       tiles="OpenStreetMap", prefer_canvas=True)
-
-        # Draw AOI box
-        if st.session_state.aoi_bbox:
-            bb = st.session_state.aoi_bbox
-            folium.Rectangle(
-                bounds=[[bb[1], bb[0]], [bb[3], bb[2]]],
-                color="#38bdf8", fill=False, weight=2.5,
-                tooltip=f"AOI · {bbox_to_str(bb)}"
-            ).add_to(m)
-
-        # Flood water layer (from detection output or mock indicator)
-        ctr = map_center()
-        folium.CircleMarker(
-            location=ctr, radius=35, weight=2,
-            color="#3b82f6", fill=True, fill_color="#3b82f6", fill_opacity=0.45,
-            tooltip="S1 Inundation zone (representative)"
-        ).add_to(m)
-
-        # Debris layer
-        folium.CircleMarker(
-            location=[ctr[0]+0.012, ctr[1]-0.012], radius=22, weight=2,
-            color="#f59e0b", fill=True, fill_color="#f59e0b", fill_opacity=0.5,
-            tooltip="Debris / mud flow zone (representative)"
-        ).add_to(m)
-
-        # Settlement markers from summary
-        for i, s in enumerate(sd.get("top_settlements", [])):
-            status = s.get("status", "")
-            colour = "red" if status == "cut off" else ("orange" if "detour" in status else "green")
-            offset_lat = ctr[0] + (i - len(sd.get("top_settlements",[])) / 2) * 0.018
-            offset_lon = ctr[1] + (i % 2 - 0.5) * 0.015
-            pre_dist_m = s.get('pre_dist_m')
-            pre_dist_str = f"{pre_dist_m/1000:.1f} km" if pre_dist_m else "N/A"
-            popup_html = (
-                f"<b>{s.get('name','?')}</b><br>Status: <b>{status}</b>"
-                f"<br>Pop: {s.get('population','N/A')}"
-                f"<br>Pre-dist: {pre_dist_str}"
-            )
-            folium.Marker(
-                location=[offset_lat, offset_lon],
-                popup=folium.Popup(popup_html, max_width=200),
-                icon=folium.Icon(color=colour, icon="home", prefix="fa"),
-                tooltip=s.get("name","Settlement")
-            ).add_to(m)
-
-        # Draw tool for custom AOI
-        Draw(export=False, draw_options={
-            "polyline": False, "circle": False, "marker": False,
-            "circlemarker": False,
-            "polygon": {"allowIntersection": False, "showArea": True},
-            "rectangle": {"showArea": True},
-        }).add_to(m)
-        MeasureControl(primary_length_unit="kilometers").add_to(m)
-
-        map_data = st_folium(m, width="100%", height=540, returned_objects=["all_drawings"])
-
-        # If user drew a rectangle/polygon, offer to use it as AOI
-        drawn = (map_data or {}).get("all_drawings")
-        if drawn:
-            feat = drawn[-1] if isinstance(drawn, list) else drawn
-            geom = feat.get("geometry", {})
-            if geom.get("type") == "Polygon":
-                coords = geom["coordinates"][0]
-                lons = [c[0] for c in coords]
-                lats = [c[1] for c in coords]
-                drawn_bb = [min(lons), min(lats), max(lons), max(lats)]
-                st.info(f"Drawn bbox: `{bbox_to_str(drawn_bb)}`")
-                if st.button("✅ Use drawn AOI"):
-                    st.session_state.aoi_bbox = drawn_bb
-                    st.session_state.step = max(st.session_state.step, 2)
-                    st.rerun()
-
-    with col_legend:
-        st.markdown("**Map legend**")
-        st.markdown("🟦 Flood water inundation")
-        st.markdown("🟧 Debris / mud flow")
-        st.markdown("🔴 Cut-off settlement")
-        st.markdown("🟢 Reachable settlement")
-        st.markdown("🟦 AOI boundary")
-        if sd:
-            st.markdown("---")
-            st.markdown(f"**Event:** {sd.get('event_name','—')}")
-            st.markdown(f"**Date:** {sd.get('flood_date','—')}")
-            st.markdown(f"**Run ID:** `{sd.get('run_id','—')}`")
+        st.markdown("### Rescuer location")
+        st.caption("Choose the button to ask your browser for location permission. Your location is read only after you choose it.")
+        gps = components.declare_component("rescue_gps", path=str(PROJECT_ROOT / "app" / "gps_component"))
+        gps_value = gps(key="rescue_gps_location", default=None)
+        current_gps = None
+        if isinstance(gps_value, dict) and gps_value.get("lat") is not None and gps_value.get("lon") is not None:
+            current_gps = (float(gps_value["lat"]), float(gps_value["lon"]))
+            gps_id = (round(current_gps[0], 6), round(current_gps[1], 6))
+            if st.session_state.get("_last_gps_location") != gps_id:
+                st.session_state["route_start_lat"], st.session_state["route_start_lon"] = current_gps
+                st.session_state["_last_gps_location"] = gps_id
+            st.success(f"Current location: {current_gps[0]:.6f}, {current_gps[1]:.6f} (±{float(gps_value.get('accuracy_m', 0)):.0f} m)")
         else:
-            st.info("No run yet. Use the sidebar to set your location and run the pipeline.")
+            st.info("Current location is not available yet. Choose ‘Allow location access for directions’ above, then allow it in your browser prompt. You can still enter a start point manually.")
 
-# ── Tab 2: Infrastructure ─────────────────────────────────────────────────────
-with tab_infra:
-    if not sd:
-        st.info("Run the pipeline first to see infrastructure damage assessment.")
-    else:
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Buildings affected", sd.get("buildings_affected", 0))
-        c2.metric("Road damage (km)", sd.get("road_km_affected", 0))
-        c3.metric("Bridges affected", sd.get("bridges_affected", 0))
-        st.caption("Computed by intersecting S1/S2 flood/debris polygons with pre-event OSM features.")
-        st.markdown("""
-**Methodology:**
-- OSM data fetched at snapshot date strictly before the flood event.
-- Flood and debris polygons buffered ±20 m for pixel uncertainty.
-- Spatial join (predicate: *intersects*) identifies affected features.
-- Road damage is the total length of highway segments within the flood/debris envelope.
-- Bridge damage counted from `bridge=yes` or `man_made=bridge` tags.
-        """)
-
-# ── Tab 3: Cut-off Settlements ────────────────────────────────────────────────
-with tab_cutoff:
-    if not sd:
-        st.info("Run the pipeline first to see cut-off analysis.")
-    else:
-        rows = sd.get("top_settlements", [])
-        if not rows:
-            st.info("No settlements identified in the AOI (OSM place= nodes not found).")
+        preview_col, impact_col = st.columns([1, 1])
+        with preview_col:
+            st.markdown("**Selected-scene before / after**")
+            for sensor in stats["sensors_analyzed"]:
+                a, b = st.columns(2)
+                with a:
+                    before_day = item_summary(result["paired"][sensor][0])["date"]
+                    st.image(stats["previews"][sensor][0], caption=f"{sensor} before · {before_day}", use_container_width=True)
+                with b:
+                    after_day = item_summary(result["paired"][sensor][1])["date"]
+                    st.image(stats["previews"][sensor][1], caption=f"{sensor} after · {after_day}", use_container_width=True)
+        with impact_col:
+            st.markdown("**Candidate impact map**")
+            impact_map = folium.Map(location=[loc["lat"], loc["lon"]], zoom_start=12, tiles="OpenStreetMap")
+            if flood_data["features"]:
+                folium.GeoJson(flood_data, name="Candidate new water", style_function=lambda _: {
+                    "color": "#ef4444", "fillColor": "#ef4444", "fillOpacity": .38, "weight": 2}).add_to(impact_map)
+            debris_path = run_dir / "disturbed_surface_candidates.geojson"
+            if debris_path.exists():
+                debris_data = json.loads(debris_path.read_text(encoding="utf-8"))
+                if debris_data["features"]:
+                    folium.GeoJson(debris_data, name="Disturbed bare surface (debris/landslide candidate)",
+                                   style_function=lambda _: {"color": "#a855f7", "fillColor": "#a855f7",
+                                                             "fillOpacity": .25, "weight": 2}).add_to(impact_map)
+            roads_path = run_dir / "affected_roads.geojson"
+            if roads_path.exists():
+                roads_data = json.loads(roads_path.read_text(encoding="utf-8"))
+                if roads_data["features"]:
+                    folium.GeoJson(roads_data, name="Roads crossing candidate water", style_function=lambda _: {
+                        "color": "#f97316", "weight": 3}).add_to(impact_map)
+            isolated_path = run_dir / "isolated_settlements.geojson"
+            for filename, layer_name, color in (("exposed_buildings.geojson", "Buildings intersecting candidate area", "#dc2626"),
+                                                ("exposed_bridges.geojson", "Bridges intersecting candidate area", "#7c3aed")):
+                feature_path = run_dir / filename
+                if feature_path.exists():
+                    feature_data = json.loads(feature_path.read_text(encoding="utf-8"))
+                    if feature_data["features"]:
+                        folium.GeoJson(feature_data, name=layer_name, marker=folium.CircleMarker(radius=4, color=color,
+                                     fill=True, fill_opacity=.8), style_function=lambda _, c=color: {"color": c, "weight": 3}).add_to(impact_map)
+            if isolated_path.exists():
+                isolated_data = json.loads(isolated_path.read_text(encoding="utf-8"))
+                if isolated_data["features"]:
+                    folium.GeoJson(isolated_data, name="Potentially disconnected settlements").add_to(impact_map)
+            route_data = st.session_state.get("route_result")
+            if route_data:
+                folium.GeoJson(route_data["geometry"], name="OSRM route · safety unverified",
+                               style_function=lambda _: {"color": "#2563eb", "weight": 5}).add_to(impact_map)
+            for area in affected_areas:
+                coords = f"{area['latitude']:.6f}, {area['longitude']:.6f}"
+                folium.Marker([area["latitude"], area["longitude"]], tooltip=area["name"],
+                              popup=folium.Popup(f"{area['name']}<br>Coordinates: {coords}", max_width=320),
+                              icon=folium.Icon(color="red", icon="info-sign")).add_to(impact_map)
+            if current_gps:
+                folium.Marker([current_gps[0], current_gps[1]], tooltip="Your current location",
+                              popup=f"Your current location<br>Coordinates: {current_gps[0]:.6f}, {current_gps[1]:.6f}",
+                              icon=folium.Icon(color="blue", icon="user", prefix="fa")).add_to(impact_map)
+            folium.LayerControl().add_to(impact_map)
+            st_folium(impact_map, height=370, width=700, returned_objects=[])
+            if affected_areas:
+                st.markdown("**Flood-affected candidate areas · approximate place names from OpenStreetMap where available**")
+                st.dataframe(affected_areas, hide_index=True, use_container_width=True)
+            else:
+                st.info("No candidate-water polygon was detected for this scene pair, so there are no affected-area coordinates to list.")
+        st.caption(f"Analysis files saved to `{analysis_result['run_dir']}`. Candidate-water polygons, exposure GeoJSON, mask GeoTIFF, and source-scene previews are included.")
+        st.info(stats["note"])
+        st.markdown("### Rescuer navigation")
+        st.caption("Road directions use the public OSRM road graph. Mapped hazard intersections are screening signals only; route safety must be confirmed locally.")
+        if affected_areas:
+            first_area = affected_areas[0]
+            suggested_name = first_area["name"]
+            suggested_lat, suggested_lon = first_area["latitude"], first_area["longitude"]
         else:
-            df = pd.DataFrame(rows).drop(columns=["geometry"], errors="ignore")
-            df["pre_dist_km"] = df.get("pre_dist_m", pd.Series()).apply(
-                lambda x: f"{x/1000:.1f}" if pd.notna(x) and x else "N/A"
-            )
-            df["post_dist_km"] = df.get("post_dist_m", pd.Series()).apply(
-                lambda x: f"{x/1000:.1f}" if pd.notna(x) and x else "∞"
-            )
-            st.dataframe(
-                df[["name","population","status","pre_dist_km","post_dist_km"]].rename(columns={
-                    "name":"Settlement","population":"Population (OSM)",
-                    "status":"Connectivity Status",
-                    "pre_dist_km":"Pre-event dist (km)",
-                    "post_dist_km":"Post-event dist (km)"
-                }),
-                use_container_width=True, hide_index=True
-            )
-            st.caption("""
-Status classes: **cut off** = no path to town/hospital without crossing flooded road;
-**detour** = path >50% longer than pre-event; **reachable** = no significant impact.
-            """)
-
-# ── Tab 4: Copilot ────────────────────────────────────────────────────────────
-with tab_copilot:
-    st.markdown("""
-**Rescue Copilot** answers questions about this specific event using only numbers
-from the pipeline's `summary.json` — no external LLM inference.
-    """)
-    if not st.session_state.latest_summary_path:
-        st.info("Run the pipeline first so the Copilot has real data to query.")
-    else:
-        example_qs = [
-            "Which settlements are cut off?",
-            "How many buildings are affected?",
-            "What is the total road damage?",
-            "How much area was flooded?",
-        ]
-        for eq in example_qs:
-            if st.button(eq, key=f"eq_{eq}"):
-                st.session_state["copilot_q"] = eq
-        q = st.text_input("Your question:", value=st.session_state.get("copilot_q",""))
-        if q:
-            ans = copilot_qa(q, st.session_state.latest_summary_path)
-            st.success(f"**Answer:** {ans}")
-            st.caption("⚠️ Numbers sourced deterministically from pipeline artefacts.")
-
-# ── Tab 5: Reports ────────────────────────────────────────────────────────────
-with tab_reports:
-    if not st.session_state.latest_summary_path:
-        st.info("Run the pipeline to generate reports.")
-    else:
-        run_dir = Path(st.session_state.latest_summary_path).parent
-        for lang, label in [("en","English"), ("ne","Nepali (नेपाली)")]:
-            f = run_dir / f"report_{lang}.html"
-            if f.exists():
-                with open(f, encoding="utf-8") as fh:
-                    st.download_button(
-                        f"📥 SITREP — {label}",
-                        fh.read(), file_name=f"SITREP_{lang.upper()}.html",
-                        mime="text/html", use_container_width=True
-                    )
-        # Show raw summary JSON
-        with st.expander("📋 Raw summary.json"):
-            st.json(sd)
-
-        if st.session_state.run_log:
-            with st.expander("🕒 Run log"):
-                for line in st.session_state.run_log[-10:]:
-                    st.code(line)
-
-# ── Tab 6: Provenance ─────────────────────────────────────────────────────────
-with tab_provenance:
-    if sd:
-        inp = sd.get("inputs", {})
-        st.markdown(f"""
-| Field | Value |
-|-------|-------|
-| S1 Pre-event scene | `{inp.get("s1_pre","N/A")}` |
-| S1 Post-event scene | `{inp.get("s1_post","N/A")}` |
-| S1 Relative orbit | `{inp.get("s1_relative_orbit","N/A")}` |
-| S2 Pre-event scene | `{inp.get("s2_pre","N/A")}` |
-| S2 Post-event scene | `{inp.get("s2_post","N/A")}` |
-| DEM tiles | `{inp.get("dem_tiles","N/A")}` |
-| OSM snapshot date | `{sd.get("osm_date","N/A")}` |
-| OSM features ingested | `{inp.get("osm_features_count","N/A")}` |
-| Run ID | `{sd.get("run_id","N/A")}` |
-        """)
-
-    st.markdown("""
-#### Challenge-rule compliance
-- ✅ Only Sentinel-1 GRD IW scenes with matching relative orbit and pass direction are compared.
-- ✅ OSM snapshot date enforced to be strictly before the flood date.
-- ✅ EMSR927 / UNOSAT outputs are confined to `evaluation/` and never imported by `src/`.
-- ✅ All KPIs are computed from `runs/*/summary.json`, not hard-coded.
-- ✅ DEM: Copernicus GLO-30 via Microsoft Planetary Computer.
-    """)
-    st.markdown("""
-#### Limitations
-- **Radar shadow / layover:** steep Himalayan valley walls may block sensor view.
-- **10 m resolution:** narrow footbridges or small landslide dams may be missed.
-- **No real S1 download:** pixel arrays are synthetic in prototype mode; replace with
-  actual STAC asset download and `rasterio` read for production.
-- **OSM completeness:** rural Nepal mapping may be incomplete.
-    """)
-
-    st.markdown("""
-<div class="attr">
-<b>Attribution:</b> Contains modified Copernicus Sentinel data 2026.
-Produced using Copernicus WorldDEM-30 © DLR e.V. 2010–2014 and © Airbus Defence and Space GmbH 2014–2018
-provided under COPERNICUS by the European Union and ESA; all rights reserved.
-© OpenStreetMap contributors (ODbL).
-Training data references: Bountos et al. 2024 (Kuro Siwo); Bonafilia et al. 2020 (Sen1Floods11).<br>
-<b>Educational prototype, not an operational tool.</b>
-</div>
-""", unsafe_allow_html=True)
+            candidate = stats.get("candidate_water_location") or {}
+            suggested_lat = float(candidate.get("latitude", loc["lat"]))
+            suggested_lon = float(candidate.get("longitude", loc["lon"]))
+            suggested_name = "AOI center (no candidate-water polygon)"
+        destinations = [(f"System-suggested incident · {suggested_name} · {suggested_lat:.6f}, {suggested_lon:.6f}", suggested_lat, suggested_lon),
+                        ("Selected AOI center", float(loc["lat"]), float(loc["lon"])),
+                        ("Manual coordinates", None, None)]
+        for filename, label in (("exposed_buildings.geojson", "Exposed building"),
+                                ("exposed_bridges.geojson", "Exposed bridge"),
+                                ("isolated_settlements.geojson", "Potentially isolated settlement")):
+            path = run_dir / filename
+            if path.exists():
+                try:
+                    features = json.loads(path.read_text(encoding="utf-8")).get("features", [])
+                    for index, feature in enumerate(features, 1):
+                        point = shape(feature["geometry"]).representative_point()
+                        destinations.append((f"{label} {index} · {point.y:.5f}, {point.x:.5f}", point.y, point.x))
+                except Exception:
+                    pass
+        selected_destination = st.selectbox("Incident destination (suggested from mapped candidate water)", destinations,
+                                              format_func=lambda d: d[0], index=0, key="route_destination_choice_v2")
+        destination_choice = selected_destination[0]
+        if st.session_state.get("_last_destination_choice_v2") != destination_choice:
+            if selected_destination[1] is not None:
+                st.session_state["route_dest_lat"] = float(selected_destination[1])
+                st.session_state["route_dest_lon"] = float(selected_destination[2])
+            st.session_state["_last_destination_choice_v2"] = destination_choice
+        if isinstance(gps_value, dict):
+            gps_location = (round(float(gps_value["lat"]), 6), round(float(gps_value["lon"]), 6))
+            if st.session_state.get("_last_gps_location") != gps_location:
+                st.session_state["route_start_lat"], st.session_state["route_start_lon"] = gps_location
+                st.session_state["_last_gps_location"] = gps_location
+        st.session_state.setdefault("route_start_lat", float(loc["lat"]))
+        st.session_state.setdefault("route_start_lon", float(loc["lon"]))
+        st.session_state.setdefault("route_dest_lat", float(suggested_lat))
+        st.session_state.setdefault("route_dest_lon", float(suggested_lon))
+        route_cols = st.columns(4)
+        start_lat = route_cols[0].number_input("Start latitude", format="%.6f", key="route_start_lat")
+        start_lon = route_cols[1].number_input("Start longitude", format="%.6f", key="route_start_lon")
+        destination_lat = route_cols[2].number_input("Destination latitude", format="%.6f", key="route_dest_lat")
+        destination_lon = route_cols[3].number_input("Destination longitude", format="%.6f", key="route_dest_lon")
+        maps_url = "https://www.google.com/maps/dir/?" + urlencode({
+            "api": "1", "origin": f"{start_lat:.6f},{start_lon:.6f}",
+            "destination": f"{destination_lat:.6f},{destination_lon:.6f}", "travelmode": "driving",
+        })
+        st.link_button("Open selected incident destination in Google Maps", maps_url, type="primary")
+        st.caption("Google Maps opens in a new tab with the selected coordinates. It cannot confirm flood or road safety.")
+        if st.button("Get local route screening", key="get_rescue_route"):
+            st.session_state.pop("route_result", None)
+            try:
+                flood_geom = None
+                flood_path = run_dir / "flood_candidates.geojson"
+                if flood_path.exists():
+                    fc = json.loads(flood_path.read_text(encoding="utf-8"))
+                    if fc.get("features"):
+                        from shapely.geometry import shape
+                        from shapely.ops import unary_union
+                        flood_geom = mapping(unary_union([shape(f["geometry"]) for f in fc["features"]]))
+                roads_geom = None
+                affected_path = run_dir / "affected_roads.geojson"
+                if affected_path.exists():
+                    roads_fc = json.loads(affected_path.read_text(encoding="utf-8"))
+                    if roads_fc.get("features"):
+                        from shapely.geometry import shape
+                        from shapely.ops import unary_union
+                        roads_geom = mapping(unary_union([shape(f["geometry"]) for f in roads_fc["features"]]))
+                with st.spinner("Requesting road route and available alternatives…"):
+                    st.session_state["route_result"] = get_routes((start_lat, start_lon),
+                        (destination_lat, destination_lon), flood_geom, roads_geom)
+                st.rerun()
+            except Exception as exc:
+                st.error(f"Road directions unavailable: {exc}. Check coordinates or try again when routing service is reachable.")
+        route_data = st.session_state.get("route_result")
+        if route_data:
+            st.write(f"**{route_data['distance_km']:.1f} km · {route_data['duration_min']:.0f} min · {route_data['alternatives']} route option(s)**")
+            if route_data["possibly_affected"]:
+                st.warning("The selected route intersects mapped candidate flooding or roads flagged as exposed. Use only after local validation.")
+            st.error(route_data["safety"])
+            if route_data["instructions"]:
+                with st.expander("Turn-by-turn instructions"):
+                    for step in route_data["instructions"]:
+                        st.markdown(f"- {step}")
+    if st.button("Draft source-grounded situation note", disabled=not accepted_pairs):
+        facts = {"location": loc["name"], "event_date": result["event_date"], "catalog_scene_pairs": {}}
+        for sensor, pair in accepted_pairs.items():
+            before, after = item_summary(pair[0]), item_summary(pair[1])
+            facts["catalog_scene_pairs"][sensor] = {"before_date": before["date"], "after_date": after["date"]}
+            if before["orbit"] is not None:
+                facts["catalog_scene_pairs"][sensor]["relative_orbit"] = before["orbit"]
+                facts["catalog_scene_pairs"][sensor]["pass"] = before["pass"]
+            if before["cloud_cover_percent"] is not None:
+                facts["catalog_scene_pairs"][sensor]["before_cloud_percent"] = round(float(before["cloud_cover_percent"]))
+            if after["cloud_cover_percent"] is not None:
+                facts["catalog_scene_pairs"][sensor]["after_cloud_percent"] = round(float(after["cloud_cover_percent"]))
+        if st.session_state.get("analysis_result"):
+            stats = st.session_state["analysis_result"]["stats"]
+            keys = ("candidate_flood_area_ha", "disturbed_bare_surface_candidate_area_ha",
+                    "buildings_intersecting_candidate_water", "bridges_intersecting_candidate_water",
+                    "road_length_intersecting_candidate_water_km",
+                    "settlements_disconnected_from_towns_or_healthcare", "warnings")
+            facts["system_analysis_stats"] = {key: copy.deepcopy(stats.get(key)) for key in keys}
+        try:
+            with st.spinner("Drafting a short note…"):
+                st.markdown(groq_copilot(facts))
+        except Exception as exc:
+            st.error(f"Copilot unavailable: {exc}")
+else:
+    st.info("Enter a location and event date to find the nearest available Sentinel scenes.")

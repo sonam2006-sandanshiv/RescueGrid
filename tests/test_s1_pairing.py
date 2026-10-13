@@ -26,7 +26,7 @@ def test_select_s1_pair():
     assert pair[0] == pre2
     assert pair[1] == post2
     
-def test_select_s1_pair_no_match():
+def test_select_s1_pair_falls_back_to_nearest_real_cross_orbit_pair():
     flood_date = "2026-08-26T00:00:00"
     base_dt = datetime(2026, 8, 26, tzinfo=timezone.utc)
     
@@ -36,4 +36,4 @@ def test_select_s1_pair_no_match():
     items = [pre1, post1]
     
     pair = select_s1_pair(items, flood_date)
-    assert pair is None
+    assert pair == (pre1, post1)

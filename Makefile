@@ -17,7 +17,7 @@ dashboard:
 	streamlit run app/dashboard.py
 
 eval:
-	python -m evaluation.metrics
+	python -m evaluation.emsr927_comparison
 
 test:
 	pytest tests/

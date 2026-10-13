@@ -1,111 +1,104 @@
+"""Pre-event OpenStreetMap layers from the ohsome history API."""
+from __future__ import annotations
+
+from datetime import date
+from io import BytesIO
 import logging
+import os
+from typing import Any
+
+import pyarrow.parquet as parquet
 import requests
-import geopandas as gpd
-import json
-from shapely.geometry import LineString, Point, Polygon
-from datetime import datetime
+from shapely import wkb
+from shapely.geometry import mapping
 
 logger = logging.getLogger(__name__)
+OHSOME_V2_API = "https://api.heigit.org/ohsome-api/v2-rc/extraction/features.parquet"
+COMBINED_FILTER = (
+    "(building=* and building!=no and geometry:polygon) or "
+    "(highway=* and geometry:line) or "
+    "((bridge=yes or man_made=bridge) and (geometry:line or geometry:polygon)) or "
+    "((amenity=hospital or amenity=clinic or healthcare=*) and "
+    "(geometry:point or geometry:line or geometry:polygon)) or "
+    "(place in (city,town,village,hamlet) and (geometry:point or geometry:polygon))"
+)
 
-OHSOME_API = "https://api.ohsome.org/v1/elements/geometry"
 
-def _validate_osm_date(osm_date, flood_date):
-    """Ensure OSM snapshot date is strictly before the flood event."""
-    osm_dt = datetime.fromisoformat(osm_date)
-    flood_dt = datetime.fromisoformat(flood_date)
-    
-    if osm_dt >= flood_dt:
+def _validate_osm_date(osm_date: str, flood_date: str) -> None:
+    if date.fromisoformat(osm_date) >= date.fromisoformat(flood_date):
         raise ValueError(f"OSM date ({osm_date}) must be strictly BEFORE flood date ({flood_date})")
 
-def fetch_osm_data(bbox, flood_date, osm_date="2026-07-27"):
-    """
-    Fetches OSM data using ohsome API at a specific snapshot date.
-    Falls back to mock geospatial features if the external API returns an error or is blocked.
-    bbox format: [minx, miny, maxx, maxy]
-    """
-    _validate_osm_date(osm_date, flood_date)
-    
-    b_str = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
-    
-    filter_query = (
-        "building=* or "
-        "highway=* or "
-        "bridge=yes or man_made=bridge or "
-        "amenity in (hospital,clinic) or healthcare=* or "
-        "place in (city,town,village,hamlet)"
-    )
-    
-    params = {
-        "bboxes": b_str,
-        "time": osm_date,
-        "filter": filter_query,
-        "properties": "tags"
-    }
-    
-    headers = {
-        "User-Agent": "FloodMapperHackathon/1.0 (flood-damage-mapping-bot)"
-    }
-    
-    logger.info(f"Querying ohsome API for bbox {b_str} at time {osm_date}")
-    
-    try:
-        response = requests.post(OHSOME_API, data=params, headers=headers, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            features = data.get("features", [])
-            logger.info(f"Retrieved {len(features)} features from OSM")
-            if features:
-                gdf = gpd.GeoDataFrame.from_features(features)
-                gdf.set_crs("EPSG:4326", inplace=True)
-                return gdf
-        else:
-            logger.warning(f"Ohsome API returned HTTP {response.status_code}. Using synthetic mock OSM data.")
-    except Exception as e:
-        logger.warning(f"Ohsome API query failed ({e}). Using synthetic mock OSM data.")
-        
-    # Fallback synthetic OSM data within the bounding box
+
+def _geometry(row: dict[str, Any]):
+    value = row.get("geometry")
+    if value is None:
+        value = row.get("geom")
+    if value is None:
+        value = row.get("wkb_geometry")
+    if value is None:
+        return None
+    if hasattr(value, "geom_type"):
+        return value
+    if isinstance(value, str):
+        return wkb.loads(value, hex=True)
+    return wkb.loads(value)
+
+
+def fetch_osm_layers(bbox: tuple[float, float, float, float], snapshot_date: date,
+                     flood_date: date, timeout: int = 40) -> dict[str, dict[str, Any]]:
+    """Fetch one real pre-event GeoParquet snapshot and split it into map layers."""
+    _validate_osm_date(snapshot_date.isoformat(), flood_date.isoformat())
+    api_key = os.environ.get("OHSOME_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Historical OSM requires OHSOME_API_KEY; no synthetic features were used.")
     minx, miny, maxx, maxy = bbox
-    cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    
-    features = [
-        # Roads connecting town to villages
-        {
-            "geometry": LineString([(minx + 0.02, cy), (cx, cy), (maxx - 0.02, cy)]),
-            "properties": {"highway": "primary", "name": "Trishuli Highway"}
-        },
-        {
-            "geometry": LineString([(cx, miny + 0.02), (cx, cy), (cx, maxy - 0.02)]),
-            "properties": {"highway": "secondary", "name": "Bhote Koshi Access Road"}
-        },
-        # Bridge over river
-        {
-            "geometry": Point(cx, cy),
-            "properties": {"bridge": "yes", "highway": "primary", "name": "Friendship Bridge"}
-        },
-        # Hospital / Town center
-        {
-            "geometry": Point(cx + 0.01, cy + 0.01),
-            "properties": {"place": "town", "name": "Dhulikhel Central", "amenity": "hospital"}
-        },
-        # Remote villages
-        {
-            "geometry": Point(minx + 0.03, cy + 0.03),
-            "properties": {"place": "village", "name": "Tatopani Village", "population": "1200"}
-        },
-        {
-            "geometry": Point(maxx - 0.03, cy - 0.03),
-            "properties": {"place": "village", "name": "Larcha Settlement", "population": "450"}
-        },
-        # Buildings
-        {
-            "geometry": Polygon([(cx - 0.001, cy - 0.001), (cx + 0.001, cy - 0.001), (cx + 0.001, cy + 0.001), (cx - 0.001, cy + 0.001)]),
-            "properties": {"building": "yes", "name": "School"}
-        },
-        {
-            "geometry": Polygon([(minx + 0.03, cy + 0.03), (minx + 0.032, cy + 0.03), (minx + 0.032, cy + 0.032), (minx + 0.03, cy + 0.032)]),
-            "properties": {"building": "yes", "name": "Health Post"}
-        }
-    ]
-    
-    gdf = gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")
-    return gdf
+    aoi = {"type": "Polygon", "coordinates": [[[minx, miny], [maxx, miny],
+             [maxx, maxy], [minx, maxy], [minx, miny]]]}
+    response = requests.post(OHSOME_V2_API, json={"aoi": aoi,
+        "filter": COMBINED_FILTER, "time": snapshot_date.isoformat()},
+        headers={"Authorization": api_key, "User-Agent": "FloodLensAI/1.0"}, timeout=timeout)
+    if not response.ok:
+        raise RuntimeError(f"ohsome snapshot failed ({response.status_code}): {response.text[:300]}")
+    table = parquet.read_table(BytesIO(response.content))
+    result = {name: {"type": "FeatureCollection", "features": []}
+              for name in ("buildings", "roads", "bridges", "health", "settlements")}
+    for row in table.to_pylist():
+        try:
+            geom = _geometry(row)
+        except (TypeError, ValueError):
+            continue
+        if geom is None:
+            continue
+        raw_tags = row.get("tags") or {}
+        if not isinstance(raw_tags, dict):
+            try:
+                raw_tags = dict(raw_tags)
+            except (TypeError, ValueError):
+                raw_tags = {}
+        tags = {str(key): str(value) for key, value in raw_tags.items()}
+        feature = {"type": "Feature", "geometry": mapping(geom),
+                   "properties": {**tags, "osm_type": row.get("osm_type"), "osm_id": row.get("osm_id")}}
+        if tags.get("building") not in (None, "no") and geom.geom_type in ("Polygon", "MultiPolygon"):
+            result["buildings"]["features"].append(feature)
+        if tags.get("highway") and geom.geom_type in ("LineString", "MultiLineString"):
+            result["roads"]["features"].append(feature)
+        if tags.get("bridge") == "yes" or tags.get("man_made") == "bridge":
+            result["bridges"]["features"].append(feature)
+        if tags.get("amenity") in ("hospital", "clinic") or "healthcare" in tags:
+            result["health"]["features"].append(feature)
+        if tags.get("place") in ("city", "town", "village", "hamlet"):
+            result["settlements"]["features"].append(feature)
+    logger.info("Fetched pre-event OSM layers at %s: %s", snapshot_date,
+                {key: len(value["features"]) for key, value in result.items()})
+    return result
+
+
+def fetch_osm_data(bbox, flood_date, osm_date="2026-07-27"):
+    """Legacy pipeline adapter that returns the real layers as one GeoDataFrame."""
+    import geopandas as gpd
+    layers = fetch_osm_layers(tuple(bbox), date.fromisoformat(osm_date),
+                              date.fromisoformat(flood_date))
+    features = [feature for collection in layers.values() for feature in collection["features"]]
+    if not features:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+    return gpd.GeoDataFrame.from_features(features, crs="EPSG:4326")

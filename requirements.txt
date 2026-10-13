@@ -18,3 +18,4 @@ python-dotenv>=1.0.0
 pystac-client>=0.7.5
 stackstac>=0.5.0
 planetary-computer>=1.0.0
+pyarrow>=14.0.0
