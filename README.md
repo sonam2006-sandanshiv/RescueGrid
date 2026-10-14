@@ -1,6 +1,6 @@
-# FloodLens AI
+# RescueGrid
 
-FloodLens gives rescue teams one fast workflow: search for a place, choose an event date, compare the nearest Sentinel-1 and Sentinel-2 scenes, and map candidate changes.
+RescueGrid gives rescue teams one fast workflow: search for a place, choose an event date, compare the nearest Sentinel-1 and Sentinel-2 scenes, and map candidate changes.
 
 ## Run the dashboard
 
