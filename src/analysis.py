@@ -13,6 +13,7 @@ from typing import Any
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
+import requests
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import shapes
@@ -21,13 +22,13 @@ from rasterio.vrt import WarpedVRT
 from rasterio.warp import transform_bounds, transform_geom
 from shapely.geometry import LineString, MultiLineString, Point, shape, mapping
 from shapely.ops import unary_union
-from shapely.prepared import prep
 import networkx as nx
-import planetary_computer as pc
 
 
 S1_ALIASES = {"vv": ("vv", "sigma0-vv", "sigma0_vv"),
               "vh": ("vh", "sigma0-vh", "sigma0_vh")}
+S1_MASK_ALIASES = ("mask", "layover_shadow_mask", "layover-shadow-mask")
+S1_MASK_ALIASES = ("mask", "layover_shadow_mask", "layover-shadow-mask")
 S2_ALIASES = {"blue": ("b02", "b2", "blue"), "green": ("b03", "b3", "green"),
               "red": ("b04", "b4", "red"), "nir": ("b08", "b8", "nir"),
               "swir": ("b11", "b11_20m", "swir16"), "scl": ("scl", "scl_20m", "scene-classification")}
@@ -47,9 +48,41 @@ def _asset(item: dict[str, Any], aliases: tuple[str, ...]) -> str:
     raise ValueError(f"Scene {item.get('id')} has no usable {aliases[0]} raster asset")
 
 
+def _rtc_mask_valid(item: dict[str, Any], values: np.ndarray) -> np.ndarray:
+    """Decode an RTC validity mask only when STAC classes document its codes."""
+    assets = item.get("assets", {})
+    asset = next((value for key, value in assets.items() if str(key).lower() in S1_MASK_ALIASES), None)
+    classes = []
+    for band in (asset or {}).get("raster:bands", []):
+        classes.extend(band.get("classification:classes", []))
+    valid_codes = []
+    for category in classes:
+        label = " ".join(str(category.get(key, "")) for key in ("name", "description", "title")).lower()
+        code = category.get("value")
+        if code is None:
+            continue
+        invalid_words = ("shadow", "layover", "invalid", "no data", "nodata")
+        if any(word in label for word in invalid_words):
+            continue
+        if "valid" in label or "unaffected" in label or "clear" in label:
+            valid_codes.append(code)
+    if not valid_codes:
+        raise ValueError("RTC mask has no STAC-documented valid-pixel class")
+    return np.isfinite(values) & np.isin(values, valid_codes)
+
+
 def _signed_asset(href: str) -> str:
-    """Sign an unsigned Planetary Computer blob URL on demand; SDK caches tokens."""
-    return pc.sign_url(href)
+    if (".blob.core.windows.net/" not in href or "planetarycomputer" in href
+            or "sig=" in href.lower() or "se=" in href.lower()):
+        return href
+    headers = {}
+    subscription_key = os.environ.get("PC_SDK_SUBSCRIPTION_KEY", "").strip()
+    if subscription_key:
+        headers["Ocp-Apim-Subscription-Key"] = subscription_key
+    response = requests.get("https://planetarycomputer.microsoft.com/api/sas/v1/sign",
+                            params={"href": href}, headers=headers, timeout=12)
+    response.raise_for_status()
+    return response.json().get("href", href)
 
 
 def _grid(bbox: tuple[float, float, float, float], resolution_m: float = 20,
@@ -71,7 +104,7 @@ def _grid(bbox: tuple[float, float, float, float], resolution_m: float = 20,
 
 def _read(item: dict[str, Any], aliases: tuple[str, ...], crs, transform, width: int, height: int):
     href = _asset(item, aliases)
-    resampling = Resampling.nearest if aliases == S2_ALIASES["scl"] else Resampling.bilinear
+    resampling = Resampling.nearest if aliases in (S2_ALIASES["scl"], S1_MASK_ALIASES) else Resampling.bilinear
     with rasterio.Env(GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR", GDAL_HTTP_MULTIRANGE="YES",
                       GDAL_HTTP_TIMEOUT="20", GDAL_HTTP_MAX_RETRY="2"):
         with rasterio.open(href) as src:
@@ -82,50 +115,51 @@ def _read(item: dict[str, Any], aliases: tuple[str, ...], crs, transform, width:
     return data
 
 
-def _s1_water(pre: np.ndarray, post: np.ndarray) -> tuple[np.ndarray, str]:
+def _s1_water(pre: np.ndarray, post: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
     valid = np.isfinite(pre) & np.isfinite(post) & (pre > 0) & (post > 0)
     if not valid.any():
         raise ValueError("Sentinel-1 backscatter assets contain no valid overlapping pixels")
-    # Earth Search Sentinel-1 GRD assets are amplitude-only uint16. Convert
-    # amplitude to a relative dB scale; calibrated linear-power and dB assets
-    # from other catalogs are also accepted.
-    median = float(np.nanmedian(post[valid]))
-    if median > 10:
-        pre_db = 20 * np.log10(np.maximum(pre, 1e-8))
-        post_db = 20 * np.log10(np.maximum(post, 1e-8))
-    elif median > 0:
-        pre_db = 10 * np.log10(np.maximum(pre, 1e-8))
-        post_db = 10 * np.log10(np.maximum(post, 1e-8))
-    else:
-        pre_db, post_db = pre, post
+    # Planetary Computer sentinel-1-rtc assets are terrain-corrected linear
+    # gamma0 power. Convert power with 10*log10; the catalog adapter avoids
+    # substituting uncalibrated amplitude-DN assets from unrelated collections.
+    pre_db = 10 * np.log10(np.maximum(pre, 1e-8))
+    post_db = 10 * np.log10(np.maximum(post, 1e-8))
     drop = pre_db - post_db
     # Conservative open-water candidate: low post-event VV plus a meaningful
     # decrease from the same-track pre-event observation.
     threshold = float(np.nanpercentile(post_db[valid], 35))
-    candidate = valid & (post_db < threshold) & (drop > 2.5)
-    return candidate, f"Sentinel-1 relative VV decrease >2.5 dB in low-backscatter 35th-percentile pixels (threshold {threshold:.1f} dB)"
+    candidate = valid & (post_db <= threshold) & (drop > 2.5)
+    return candidate, valid, f"Sentinel-1 RTC gamma0 VV decrease >2.5 dB in low-backscatter 35th-percentile pixels (threshold {threshold:.1f} dB)"
 
 
-def _s2_water(pre_green, pre_nir, pre_swir, post_green, post_nir, post_swir, post_scl):
+def _s2_water(pre_green, pre_nir, pre_swir, post_green, post_nir, post_swir, pre_scl, post_scl):
     arrays = (pre_green, pre_nir, pre_swir, post_green, post_nir, post_swir)
     valid = np.logical_and.reduce([np.isfinite(value) for value in arrays])
     # Mask clouds, cirrus, shadow, snow, and saturated pixels when SCL is present.
-    if post_scl is not None:
-        valid &= np.isfinite(post_scl) & ~np.isin(np.rint(post_scl).astype("int16"), [0, 1, 3, 8, 9, 10, 11])
+    if pre_scl is None or post_scl is None:
+        # A clear before/after comparison cannot be assumed when either SCL is absent.
+        return np.zeros(valid.shape, dtype=bool), np.zeros(valid.shape, dtype=bool), "Sentinel-2 unknown: scene classification layer unavailable"
+    invalid_scl = [0, 1, 3, 8, 9, 10, 11]
+    valid &= np.isfinite(pre_scl) & ~np.isin(np.rint(pre_scl).astype("int16"), invalid_scl)
+    valid &= np.isfinite(post_scl) & ~np.isin(np.rint(post_scl).astype("int16"), invalid_scl)
     def mndwi(green, swir):
         return (green-swir) / (green+swir+1e-6)
     pre_index, post_index = mndwi(pre_green, pre_swir), mndwi(post_green, post_swir)
     # NDWI guard helps avoid classifying dark roofs/roads as open water.
     post_ndwi = (post_green-post_nir)/(post_green+post_nir+1e-6)
     candidate = valid & (post_index > .15) & (post_ndwi > -.05) & (pre_index < .05)
-    return candidate, "Sentinel-2 cloud-masked new-water candidate (MNDWI/NDWI change)"
+    return candidate, valid, "Sentinel-2 cloud-masked new-water candidate (MNDWI/NDWI change)"
 
 
-def _s2_bare_surface_change(pre_red, pre_nir, post_red, post_nir, post_swir, post_scl):
+def _s2_bare_surface_change(pre_red, pre_nir, post_red, post_nir, post_swir, pre_scl, post_scl):
     arrays = (pre_red, pre_nir, post_red, post_nir, post_swir)
     valid = np.logical_and.reduce([np.isfinite(value) for value in arrays])
-    if post_scl is not None:
-        valid &= np.isfinite(post_scl) & ~np.isin(np.rint(post_scl).astype("int16"), [0, 1, 3, 8, 9, 10, 11])
+    if pre_scl is not None and post_scl is not None:
+        invalid_scl = [0, 1, 3, 8, 9, 10, 11]
+        valid &= np.isfinite(pre_scl) & ~np.isin(np.rint(pre_scl).astype("int16"), invalid_scl)
+        valid &= np.isfinite(post_scl) & ~np.isin(np.rint(post_scl).astype("int16"), invalid_scl)
+    else:
+        return np.zeros(valid.shape, dtype=bool), "Disturbed-surface unknown: SCL unavailable for pre/post cloud screening"
     pre_ndvi = (pre_nir-pre_red)/(pre_nir+pre_red+1e-6)
     post_ndvi = (post_nir-post_red)/(post_nir+post_red+1e-6)
     # Vegetated before / low vegetation and elevated SWIR after is a disturbed
@@ -170,15 +204,7 @@ def _write_preview(path: Path, bands: list[np.ndarray], valid: np.ndarray | None
         for index, channel in enumerate(rgb, 1): dst.write(channel, index)
 
 
-def _bounds_overlap(a, b):
-    return not (a[2] < b[0] or a[0] > b[2] or a[3] < b[1] or a[1] > b[3])
-
-def _intersects_impact(geom, impact, prepared_impact, impact_bounds):
-    return bool(impact and _bounds_overlap(geom.bounds, impact_bounds) and prepared_impact.intersects(geom))
-
 def _road_access(roads, settlements, health, impact):
-    prepared_impact = prep(impact) if impact is not None else None
-    impact_bounds = impact.bounds if impact is not None else None
     lines = []
     for feature, geom in roads:
         if isinstance(geom, LineString): lines.append((feature, geom))
@@ -192,8 +218,7 @@ def _road_access(roads, settlements, health, impact):
         if len(coords) < 2: continue
         start, end = tuple(round(v, 5) for v in coords[0][:2]), tuple(round(v, 5) for v in coords[-1][:2])
         length = max(1.0, line.length * 111_000 * math.cos(math.radians(line.centroid.y)))
-        graph.add_edge(start, end, length=length,
-                       affected=_intersects_impact(line, impact, prepared_impact, impact_bounds))
+        graph.add_edge(start, end, length=length, affected=bool(impact and line.intersects(impact)))
         edge_records.append((start, end, feature, line, length))
     safe_graph = graph.copy()
     safe_graph.remove_edges_from([(a, b) for a, b, attrs in graph.edges(data=True) if attrs["affected"]])
@@ -209,7 +234,7 @@ def _road_access(roads, settlements, health, impact):
         point = geom if isinstance(geom, Point) else geom.representative_point()
         if graph: destinations.append(min(graph, key=lambda node: (node[0]-point.x)**2+(node[1]-point.y)**2))
     impacted_roads = [(feature, line, length) for _, _, feature, line, length in edge_records
-                      if _intersects_impact(line, impact, prepared_impact, impact_bounds)]
+                      if impact and line.intersects(impact)]
     isolated = []
     for feature, geom in settlements:
         point = geom if isinstance(geom, Point) else geom.representative_point()
@@ -229,7 +254,7 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
     """Download selected bands, classify new water, intersect OSM layers, and save map outputs."""
     output_dir.mkdir(parents=True, exist_ok=True)
     crs, transform, width, height, resolution = _grid(tuple(bbox))
-    warnings, masks, methods, previews, debris_mask = [], {}, {}, {}, None
+    warnings, masks, methods, previews, evidences, debris_mask = [], {}, {}, {}, {}, None
     if "Sentinel-1" in paired:
         pre_item, post_item = paired["Sentinel-1"]
         try:
@@ -237,7 +262,18 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
                 before_future = pool.submit(_read, pre_item, S1_ALIASES["vv"], crs, transform, width, height)
                 after_future = pool.submit(_read, post_item, S1_ALIASES["vv"], crs, transform, width, height)
                 before, after = before_future.result(), after_future.result()
-            masks["Sentinel-1"] , methods["Sentinel-1"] = _s1_water(before, after)
+            candidate, valid, method = _s1_water(before, after)
+            try:
+                before_mask = _read(pre_item, S1_MASK_ALIASES, crs, transform, width, height)
+                after_mask = _read(post_item, S1_MASK_ALIASES, crs, transform, width, height)
+                valid &= _rtc_mask_valid(pre_item, before_mask)
+                valid &= _rtc_mask_valid(post_item, after_mask)
+                candidate &= valid
+                method += "; shadow/layover/invalid pixels excluded by RTC mask"
+            except ValueError:
+                warnings.append("Sentinel-1 RTC layover/shadow mask is absent or its class codes are undocumented; terrain-geometry uncertainty remains")
+            masks["Sentinel-1"], methods["Sentinel-1"] = candidate, method
+            evidences["Sentinel-1"] = valid
             for role, array in (("before", before), ("after", after)):
                 with rasterio.open(output_dir / f"sentinel1_{role}_vv.tif", "w", driver="GTiff", height=height,
                                    width=width, count=1, dtype="float32", crs=crs, transform=transform,
@@ -267,11 +303,22 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
             before = [arrays[("before", key)] for key in ("green", "nir", "swir")]
             after = [arrays[("after", key)] for key in ("green", "nir", "swir")]
             pre_red, post_red = arrays[("before", "red")], arrays[("after", "red")]
-            try: scl = _read(post_item, S2_ALIASES["scl"], crs, transform, width, height)
-            except Exception: scl = None
-            masks["Sentinel-2"], methods["Sentinel-2"] = _s2_water(*before, *after, scl)
-            debris_mask, methods["disturbed_surface"] = _s2_bare_surface_change(
-                pre_red, before[1], post_red, after[1], after[2], scl)
+            try:
+                pre_scl = _read(pre_item, S2_ALIASES["scl"], crs, transform, width, height)
+                post_scl = _read(post_item, S2_ALIASES["scl"], crs, transform, width, height)
+            except Exception:
+                pre_scl = post_scl = None
+            s2_candidate, s2_valid, s2_method = _s2_water(*before, *after, pre_scl, post_scl)
+            if s2_valid.any():
+                masks["Sentinel-2"], methods["Sentinel-2"] = s2_candidate, s2_method
+                evidences["Sentinel-2"] = s2_valid
+            else:
+                warnings.append(s2_method)
+            if pre_scl is not None and post_scl is not None:
+                debris_mask, methods["disturbed_surface"] = _s2_bare_surface_change(
+                    pre_red, before[1], post_red, after[1], after[2], pre_scl, post_scl)
+            else:
+                warnings.append("Disturbed-surface change unknown because SCL cloud screening was unavailable")
             previews["Sentinel-2"] = []
             for role, rgb in (("before", [before[2], before[1], before[0]]),
                               ("after", [after[2], after[1], after[0]])):
@@ -282,17 +329,11 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
 
     if not masks:
         raise RuntimeError("No selected sensor had the required readable bands. " + " ".join(warnings))
-    # Prefer radar where available; optical detections corroborate radar but do
-    # not erase radar candidates in cloudy pixels.
-    primary = masks.get("Sentinel-1", masks.get("Sentinel-2"))
-    corroborated = masks.get("Sentinel-2")
-    if "Sentinel-1" in masks and corroborated is not None:
-        combined = primary & corroborated
-        if combined.sum() < 4:
-            warnings.append("Radar and optical detections had little overlap; showing the radar candidate extent.")
-            combined = primary
-    else:
-        combined = primary
+    # A detection from either sensor remains visible; corroboration is recorded
+    # separately. Cloud/no-data and invalid RTC geometry remain class 3 unknown.
+    combined = np.logical_or.reduce(list(masks.values()))
+    observed = np.logical_or.reduce(list(evidences.values()))
+    corroborated = np.logical_and(masks["Sentinel-1"], masks["Sentinel-2"]) if len(masks) > 1 else np.zeros(combined.shape, bool)
     flood_geom, cleaned = _polygonize(combined, transform, crs)
     impact_s2, _ = _polygonize(masks["Sentinel-2"], transform, crs) if "Sentinel-2" in masks else (None, None)
     debris_geom, debris_cleaned = _polygonize(debris_mask, transform, crs) if debris_mask is not None else (None, None)
@@ -302,32 +343,22 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
     impact = unary_union(impact_parts) if impact_parts else None
     if flood_geom is None:
         warnings.append("No candidate new-water pixels passed the selected thresholds.")
-    # The shipped U-Net model card has no validation metrics and its training set
-    # may contain synthetic samples; do not present its raw softmax as confidence.
-    warnings.append("Change detection uses threshold-based satellite signals; confidence is sensor support, not a calibrated probability. Field verification is required.")
-    if flood_geom is not None:
-        flood_centroid = flood_geom.centroid
-        if len(masks) == 2:
-            union_pixels = int(np.logical_or(masks["Sentinel-1"], masks["Sentinel-2"]).sum())
-            overlap_pixels = int(np.logical_and(masks["Sentinel-1"], masks["Sentinel-2"]).sum())
-            sensor_support = "cross-sensor corroborated" if union_pixels and overlap_pixels / union_pixels >= 0.2 else "weak cross-sensor agreement"
-        else:
-            sensor_support = f"single sensor ({next(iter(masks))})"
-        area_ha = flood_area_m2 / 10000
-        severity = "low" if area_ha < 1 else "moderate" if area_ha < 10 else "high"
-        flood_properties = {"classification": "candidate_new_water", "area_ha": round(area_ha, 2),
-                           "centroid_longitude": round(flood_centroid.x, 6),
-                           "centroid_latitude": round(flood_centroid.y, 6),
-                           "sensor_support": sensor_support,
-                           "confidence_note": "Qualitative sensor support only; not a probability or field confirmation.",
-                           "severity_estimate": severity,
-                           "severity_method": "area-only screening tier; unverified",
-                           "field_status": "suspected; not field verified",
-                           "method": methods.get("Sentinel-1", methods.get("Sentinel-2"))}
+    # 1 = candidate water, 2 = observed/no candidate, 3 = unknown/insufficient
+    # evidence. A valid non-flood pixel is never conflated with nodata.
+    pixel_class = np.full((height, width), 3, dtype="uint8")
+    pixel_class[observed] = 2
+    pixel_class[combined] = 1
+    confidence = np.zeros((height, width), dtype="uint8")
+    confidence[combined & ~corroborated] = 1
+    confidence[corroborated] = 2
     profile = {"driver": "GTiff", "height": height, "width": width, "count": 1,
-               "dtype": "uint8", "crs": crs, "transform": transform, "nodata": 0, "compress": "deflate"}
+               "dtype": "uint8", "crs": crs, "transform": transform, "nodata": None, "compress": "deflate"}
     with rasterio.open(output_dir / "candidate_flood_mask.tif", "w", **profile) as dst:
-        dst.write(cleaned, 1)
+        dst.write(np.where(cleaned, 1, pixel_class).astype("uint8"), 1)
+        dst.set_band_description(1, "1 candidate water; 2 observed with no candidate; 3 no usable observation/unknown")
+    with rasterio.open(output_dir / "candidate_confidence.tif", "w", **profile) as dst:
+        dst.write(confidence, 1)
+        dst.set_band_description(1, "0 no candidate; 1 single-sensor candidate; 2 cross-sensor corroborated candidate")
 
     layers = {name: _load_geojson(data) for name, data in osm_layers.items()}
     buildings = layers.get("buildings", [])
@@ -335,12 +366,8 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
     bridges = layers.get("bridges", [])
     settlements = layers.get("settlements", [])
     health = layers.get("health", [])
-    prepared_impact = prep(impact) if impact is not None else None
-    impact_bounds = impact.bounds if impact is not None else None
-    exposed_buildings = [(feature, geom) for feature, geom in buildings
-                         if _intersects_impact(geom, impact, prepared_impact, impact_bounds)]
-    exposed_bridges = [(feature, geom) for feature, geom in bridges
-                       if _intersects_impact(geom, impact, prepared_impact, impact_bounds)]
+    exposed_buildings = [(feature, geom) for feature, geom in buildings if impact and geom.intersects(impact)]
+    exposed_bridges = [(feature, geom) for feature, geom in bridges if impact and geom.intersects(impact)]
     impacted_roads, isolated, destination_count = _road_access(roads, settlements, health, impact)
     if not osm_layers:
         warnings.append("Pre-event OSM unavailable; exposure and access values are unknown, not zero.")
@@ -351,20 +378,26 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
         features = []
         for entry in entries:
             feature, geom = entry[0], entry[geom_index]
-            properties = dict(feature.get("properties", {}))
-            properties["impact_status"] = "suspected exposure; not field verified"
-            features.append({"type": "Feature", "geometry": mapping(geom), "properties": properties})
+            features.append({"type": "Feature", "geometry": mapping(geom), "properties": feature.get("properties", {})})
         return {"type": "FeatureCollection", "features": features}
 
+    water_support_features = []
+    for support, candidate_pixels in (("cross_sensor", corroborated),
+                                      ("single_sensor", combined & ~corroborated)):
+        candidate_geom, support_clean = _polygonize(candidate_pixels, transform, crs)
+        if candidate_geom is not None:
+            water_support_features.append({"type": "Feature", "geometry": mapping(candidate_geom),
+                "properties": {"classification": "candidate_new_water", "evidence_support": support,
+                    "confidence_interpretation": "cross-sensor corroboration; not a calibrated probability" if support == "cross_sensor" else "single-sensor candidate; treat as uncertain",
+                    "area_ha": round(int(support_clean.sum()) * resolution * resolution / 10000, 2),
+                    "method": methods.get("Sentinel-1", methods.get("Sentinel-2"))}})
+
     exports = {
-        "flood_candidates.geojson": ({"type": "FeatureCollection", "features": []} if flood_geom is None else
-             {"type": "FeatureCollection", "features": [{"type": "Feature", "geometry": mapping(flood_geom),
-                 "properties": flood_properties}]}),
+        "flood_candidates.geojson": {"type": "FeatureCollection", "features": water_support_features},
         "exposed_buildings.geojson": feature_collection(exposed_buildings),
         "exposed_bridges.geojson": feature_collection(exposed_bridges),
         "affected_roads.geojson": feature_collection([(f, g) for f, g, _ in impacted_roads]),
         "isolated_settlements.geojson": feature_collection([(f, shape(f["geometry"])) for f in isolated]),
-        "nearby_settlements.geojson": feature_collection(settlements),
     }
     if impact_s2 is not None:
         exports["sentinel2_water_candidates.geojson"] = {"type": "FeatureCollection", "features": [
@@ -385,14 +418,10 @@ def analyze_event(paired: dict[str, tuple[dict[str, Any], dict[str, Any]]], bbox
              "road_length_intersecting_candidate_water_km": round(road_km, 2) if "roads" in osm_layers else None,
              "settlements_disconnected_from_towns_or_healthcare": len(isolated) if destination_count else None,
              "sensors_analyzed": list(masks), "methods": methods, "warnings": warnings, "previews": previews,
+             "observed_pixels": int(observed.sum()), "unknown_pixels": int((~observed).sum()),
+             "single_sensor_candidate_pixels": int((combined & ~corroborated).sum()),
+             "cross_sensor_corroborated_pixels": int(corroborated.sum()),
              "osm_feature_counts": {name: len(features) for name, features in layers.items()},
-             "candidate_water_location": (None if flood_geom is None else {"latitude": round(flood_geom.centroid.y, 6),
-                                      "longitude": round(flood_geom.centroid.x, 6)}),
-             "candidate_water_sensor_support": (None if flood_geom is None else sensor_support),
-             "candidate_water_severity_estimate": (None if flood_geom is None else severity),
-             "note": "Threshold-based candidate water and disturbed bare-surface signals are estimates. Severity is an area-only screening tier. Bare-ground change is not confirmed debris; OSM intersections are suspected exposure, not verified damage."}
+             "note": "Satellite pixels are labelled candidate water, observed without a candidate, or unknown. Water and disturbed bare-surface signals are estimates; bare-ground change is not confirmed debris. OSM intersections are potentially exposed assets, not verified damage. Permanent water, seasonal channels, vegetation flooding, and terrain bias require local validation."}
     (output_dir / "analysis.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
     return stats
-
-
-

@@ -1,18 +1,16 @@
-aoi:
-  default_crs: "EPSG:4326"
-  metric_crs: "EPSG:32645" # UTM 45N for Nepal
-  max_size_km2: 5000
-
-ingest:
-  s1_max_days_before: 15
-  s1_max_days_after: 15
-  s2_max_cloud_cover: 30
-
-flood_classical:
-  hand_threshold_m: 20
-  slope_threshold_deg: 15
-  vv_water_threshold_db: -18
-  vv_drop_db: 3
-
-damage:
-  buffer_m: 20
+catalog:
+  cdse: https://stac.dataspace.copernicus.eu/v1
+  fallback: https://earth-search.aws.element84.com/v1
+  days_before: 48
+  days_after: 48
+  page_limit: 200
+osm:
+  endpoint: https://api.ohsome.org/v1/elements/geometry
+  timeout_seconds: 120
+  snapshot_date: null
+processing:
+  max_aoi_area_km2: 10000
+  dem_resolution_m: 30
+  water_slope_max_degrees: 15
+  high_hand_m: 30
+  pixel_buffer_m: 15

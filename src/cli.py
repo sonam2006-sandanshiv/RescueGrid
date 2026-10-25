@@ -1,19 +1,22 @@
+"""Run a full event analysis from a WGS84 bounding box."""
+from __future__ import annotations
+
 import argparse
+import logging
+from datetime import date
 from src.pipeline import run
 
-def main():
-    parser = argparse.ArgumentParser(description="Flood Mapper")
-    subparsers = parser.add_subparsers(dest="command")
-    
-    run_parser = subparsers.add_parser("run")
-    run_parser.add_argument("--bbox", type=str, required=True, help="minx,miny,maxx,maxy")
-    run_parser.add_argument("--date", type=str, required=True, help="Flood date YYYY-MM-DD")
-    
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Himalayan Flood Mapper")
+    parser.add_argument("--bbox", required=True, help="west,south,east,north")
+    parser.add_argument("--date", required=True, type=date.fromisoformat)
+    parser.add_argument("--osm-date", type=date.fromisoformat)
     args = parser.parse_args()
-    
-    if args.command == "run":
-        bbox = [float(x) for x in args.bbox.split(",")]
-        run(bbox, args.date)
+    logging.basicConfig(level=logging.INFO)
+    bbox = tuple(float(x) for x in args.bbox.split(","))
+    print(run(bbox, args.date, args.osm_date))
+
 
 if __name__ == "__main__":
     main()

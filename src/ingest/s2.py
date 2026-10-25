@@ -1,55 +1,28 @@
-import logging
-from datetime import datetime, timedelta, timezone
+"""Sentinel-2 L2A scene discovery."""
+from datetime import date, timedelta
+from src.ingest.catalog import FALLBACK_STAC, search_planetary_computer, search_stac
+from src.preprocess.s1_pairing import select_s2_pair
 
-import planetary_computer as pc
-from src.ingest.catalog import get_catalog
-
-logger = logging.getLogger(__name__)
-
-def search_s2(bbox, flood_date, max_days_before=48, max_days_after=48, max_cloud_cover=100,
-              before_target=None, after_target=None):
-    """Return a pair of real Sentinel-2 L2A scenes; cloud cover is a ranking signal, not a fake fallback."""
+def query(bbox: tuple[float, float, float, float], event: date, *,
+          max_days_before: int = 48, max_days_after: int = 48,
+          max_cloud_cover: float = 100, limit: int = 200, timeout: int = 60, **_kwargs):
+    start, end = event-timedelta(days=max_days_before), event+timedelta(days=max_days_after)
     try:
-        event = datetime.fromisoformat(str(flood_date)).replace(tzinfo=timezone.utc)
-        before_target = datetime.fromisoformat(str(before_target or flood_date)).replace(tzinfo=timezone.utc)
-        after_target = datetime.fromisoformat(str(after_target or flood_date)).replace(tzinfo=timezone.utc)
-    except (TypeError, ValueError):
-        raise ValueError("Enter valid event, preferred pre-event, and preferred post-event dates.")
-    start = event - timedelta(days=max_days_before)
-    end = event + timedelta(days=max_days_after)
-    query_range = f"{start.isoformat()}/{end.isoformat()}"
-    try:
-        items = list(get_catalog().search(collections=["sentinel-2-l2a"], bbox=bbox, datetime=query_range,
-                                          limit=500).items())
+        items = search_planetary_computer("sentinel-2-l2a", bbox, start, end,
+                                          limit=limit, timeout=timeout)
     except Exception:
-        logger.exception("Sentinel-2 L2A STAC search failed")
-        raise
-    dated = [(item, item.datetime.replace(tzinfo=timezone.utc) if item.datetime.tzinfo is None else item.datetime.astimezone(timezone.utc))
-             for item in items if item.datetime]
-    pre = [(i, d) for i, d in dated if d.date() < event.date()]
-    post = [(i, d) for i, d in dated if d.date() > event.date()]
-    if not pre or not post:
-        return None
-    def cloud(item):
-        value = item.properties.get("eo:cloud_cover")
-        return float(value) if value is not None else 100.0
-    has_clear_pair = any(cloud(a) <= max_cloud_cover and cloud(b) <= max_cloud_cover for a, _ in pre for b, _ in post)
-    def score(pair):
-        a, ad = pair[0]; b, bd = pair[1]
-        return ((0 if not has_clear_pair or (cloud(a) <= max_cloud_cover and cloud(b) <= max_cloud_cover) else 1),
-                abs((ad.date()-before_target.date()).days) + abs((bd.date()-after_target.date()).days),
-                cloud(a)+cloud(b))
-    selected = min(((a, b) for a in pre for b in post), key=score)
-    return selected[0][0], selected[1][0]
+        # Element84 is an independent public STAC fallback with COG assets.
+        items = search_stac("sentinel-2-l2a", bbox, start, end,
+                            endpoints=(FALLBACK_STAC,), limit=limit, timeout=timeout)
+    return [item for item in items
+            if float(item.get("properties", {}).get("eo:cloud_cover", 100)) <= max_cloud_cover]
 
-def get_s2_imagery_pair(bbox, target_date):
-    pair = search_s2(bbox, target_date)
-    if not pair:
-        return None
-    scenes = []
-    for item in pair:
-        signed = pc.sign_item(item)
-        preview = signed.assets.get("rendered_preview") or signed.assets.get("visual")
-        scenes.append({"id": item.id, "date": item.datetime.strftime("%Y-%m-%d %H:%M UTC"),
-                       "cloud": item.properties.get("eo:cloud_cover"), "url": preview.href if preview else None})
-    return {"pre": scenes[0], "post": scenes[1], "is_nearest": True}
+
+def search_s2(bbox: tuple[float, float, float, float], event: str | date,
+              max_days_before: int = 48, max_days_after: int = 48,
+              max_cloud_cover: float = 100, **kwargs):
+    """Dashboard-compatible query returning the least-cloudy pre/post pair."""
+    event_day = date.fromisoformat(event) if isinstance(event, str) else event
+    items = query(bbox, event_day, max_days_before=max_days_before,
+                  max_days_after=max_days_after, max_cloud_cover=max_cloud_cover, **kwargs)
+    return select_s2_pair(items, event_day)

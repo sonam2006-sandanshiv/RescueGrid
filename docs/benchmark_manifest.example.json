@@ -1,0 +1,17 @@
+{
+  "reference_provenance": {
+    "dataset": "Sen1Floods11 v1.1 HandLabeled LabelHand",
+    "citation": "Bonafilia et al., CVPR Workshops 2020",
+    "source": "https://github.com/cloudtostreet/Sen1Floods11",
+    "label_values": {"unknown": -1, "non_water": 0, "water": 1},
+    "split": "Official held-out test or held-out Bolivia event; do not tune thresholds on this split"
+  },
+  "chips": [
+    {
+      "event": "replace-with-event-name",
+      "chip_id": "replace-with-chip-id",
+      "prediction": "path/to/candidate_flood_mask.tif",
+      "reference": "path/to/LabelHand.tif"
+    }
+  ]
+}

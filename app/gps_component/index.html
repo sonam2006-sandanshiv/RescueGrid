@@ -1,40 +1,46 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8">
+  <meta charset="utf-8" />
   <style>
-    body { font: 14px sans-serif; margin: 0; color: #262730; }
-    button { padding: 8px 12px; border: 1px solid #777; border-radius: 6px; background: white; cursor: pointer; }
+    body { margin: 0; font: 14px sans-serif; color: #262730; }
+    button { border: 1px solid #9aa0a6; border-radius: 6px; padding: 8px 12px; background: white; cursor: pointer; }
     #status { margin-left: 8px; }
   </style>
 </head>
 <body>
-  <button id="gps" type="button">Allow location access for directions</button>
-  <span id="status" role="status">Location is not accessed until you choose this button.</span>
+  <button id="request-location" type="button">Allow location access for directions</button>
+  <span id="status" role="status">Location is not being accessed until you choose this button.</span>
   <script>
-    const send = (type, payload = {}) => parent.postMessage({ isStreamlitMessage: true, type, ...payload }, "*");
+    const statusNode = document.getElementById("status");
+    function send(type, value) {
+      window.parent.postMessage({ isStreamlitMessage: true, type, ...value }, "*");
+    }
     send("streamlit:componentReady", { apiVersion: 1 });
-    send("streamlit:setFrameHeight", { height: 44 });
-    document.getElementById("gps").addEventListener("click", () => {
-      const status = document.getElementById("status");
+    send("streamlit:setFrameHeight", { height: 42 });
+    document.getElementById("request-location").addEventListener("click", () => {
       if (!navigator.geolocation) {
-        status.textContent = "This browser does not provide location access. Enter coordinates manually.";
+        statusNode.textContent = "This browser does not provide location access. Enter coordinates below.";
         return;
       }
-      status.textContent = "Waiting for browser location permission…";
-      navigator.geolocation.getCurrentPosition(position => {
-        const value = { lat: position.coords.latitude, lon: position.coords.longitude,
-                        accuracy_m: position.coords.accuracy };
-        status.textContent = `Location received (±${Math.round(value.accuracy_m)} m).`;
-        send("streamlit:setComponentValue", { value, dataType: "json" });
-      }, error => {
-        const messages = {
-          1: "Location access was denied. Allow it in browser settings or enter coordinates manually.",
-          2: "Location is unavailable. Enter coordinates manually.",
-          3: "Location request timed out. Try again or enter coordinates manually."
-        };
-        status.textContent = messages[error.code] || "Location access failed. Enter coordinates manually.";
-      }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 });
+      statusNode.textContent = "Waiting for browser location permission…";
+      navigator.geolocation.getCurrentPosition(
+        position => {
+          const value = { lat: position.coords.latitude, lon: position.coords.longitude,
+                          accuracy_m: position.coords.accuracy };
+          statusNode.textContent = `Location received (±${Math.round(value.accuracy_m)} m).`;
+          send("streamlit:setComponentValue", { value, dataType: "json" });
+        },
+        error => {
+          const messages = {
+            1: "Location access was denied. Enter coordinates below or enable it in browser settings.",
+            2: "Location is unavailable. Enter coordinates below.",
+            3: "Location request timed out. Try again or enter coordinates below."
+          };
+          statusNode.textContent = messages[error.code] || "Location access failed. Enter coordinates below.";
+        },
+        { enableHighAccuracy: true, timeout: 15000, maximumAge: 60000 }
+      );
     });
   </script>
 </body>
