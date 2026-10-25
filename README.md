@@ -2,6 +2,15 @@
 
 Search a location and event date, find the nearest Sentinel-1 and Sentinel-2 scenes, map candidate new water, estimate exposed OSM infrastructure, and flag settlements whose mapped road access to a town or healthcare point may be cut.
 
+## Project layout
+
+- frontend/ — static web client for Vercel.
+- backend/ — FastAPI adapter for Render.
+- src/ — existing satellite, raster, OSM, and analysis modules used by both entry points.
+- app/dashboard.py — existing Streamlit interface, retained for local use and compatibility.
+
+The deployment folders are additive. The existing app/ and src/ paths have not been moved.
+
 ## Run
 
 1. Install Python 3.11 and install `requirements.txt`.

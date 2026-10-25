@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#10241e" />
+    <title>RescueGrid · Flood analysis</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="RescueGrid home"><span class="brand-mark">R</span><span>RescueGrid</span></a>
+      <div class="top-note"><span class="status-dot"></span> Satellite screening · evidence-led</div>
+    </header>
+    <main class="shell">
+      <section class="intro">
+        <div class="eyebrow">FLOOD RESPONSE MAPPING</div>
+        <h1>See the signal.<br /><em>Know its limits.</em></h1>
+        <p>Compare real Sentinel scenes and map candidate floodwater and potentially exposed infrastructure. Draw a small area on the map or enter its bounds.</p>
+      </section>
+      <section class="workspace" aria-label="Flood analysis workspace">
+        <aside class="panel controls">
+          <div class="section-heading"><span class="step">01</span><div><h2>Set the event</h2><p>Choose a date and a focused area.</p></div></div>
+          <form id="analysis-form">
+            <label for="flood-date">Event date</label>
+            <input id="flood-date" name="flood_date" type="date" required />
+            <fieldset>
+              <legend>Search bounds <span>W · S · E · N</span></legend>
+              <div class="bounds-grid">
+                <input aria-label="West longitude" id="west" type="number" step="any" placeholder="West" required />
+                <input aria-label="South latitude" id="south" type="number" step="any" placeholder="South" required />
+                <input aria-label="East longitude" id="east" type="number" step="any" placeholder="East" required />
+                <input aria-label="North latitude" id="north" type="number" step="any" placeholder="North" required />
+              </div>
+              <p class="hint">Each side is limited to 0.25° to keep satellite reads bounded. Click the map to set a nearby search area.</p>
+            </fieldset>
+            <label for="api-url">Render API URL</label>
+            <div class="api-row">
+              <input id="api-url" name="api_url" type="url" placeholder="https://your-service.onrender.com" autocomplete="url" />
+              <button id="health-check" class="secondary" type="button" title="Check backend health">Check</button>
+            </div>
+            <p class="hint">Saved in this browser only. Use <code>http://localhost:8000</code> for local development.</p>
+            <button class="primary" id="analyze-button" type="submit"><span>Run satellite analysis</span><span aria-hidden="true">↗</span></button>
+          </form>
+          <div class="notice"><strong>Screening estimates only.</strong> Satellite detections are candidates, infrastructure overlays are potentially exposed, and neither is field verified.</div>
+        </aside>
+        <section class="panel map-panel" aria-label="Area of interest map">
+          <div class="map-header"><div><div class="eyebrow">AREA OF INTEREST</div><h2>Choose a search area</h2></div><span class="map-hint">Click to center · zoom to refine</span></div>
+          <div id="map" role="application" aria-label="Map for selecting an area"></div>
+          <div class="legend"><span><i class="swatch water"></i>Cross-sensor candidate</span><span><i class="swatch uncertain"></i>Single-sensor candidate</span><span><i class="swatch infra"></i>Potentially exposed assets</span></div>
+        </section>
+      </section>
+      <section id="status" class="status panel" aria-live="polite" hidden></section>
+      <section id="results" class="results" hidden>
+        <div class="results-title"><div><div class="eyebrow">02 · ANALYSIS SUMMARY</div><h2>What the imagery shows</h2></div><span id="run-id" class="run-id"></span></div>
+        <div id="metrics" class="metrics-grid"></div>
+        <div id="warnings" class="warnings"></div>
+        <p id="interpretation" class="interpretation"></p>
+      </section>
+      <footer><span>Contains modified Copernicus Sentinel data · © OpenStreetMap contributors</span><span>Independent verification is required before response decisions.</span></footer>
+    </main>
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <script src="./app.js" defer></script>
+  </body>
+</html>
