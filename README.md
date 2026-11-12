@@ -1,8 +1,8 @@
-# Himalayan Flood Mapper
+# Flood Mapper
 
 Search a location and event date, find the nearest Sentinel-1 and Sentinel-2 scenes, map candidate new water, estimate exposed OSM infrastructure, and flag settlements whose mapped road access to a town or healthcare point may be cut.
 
-## Project layout
+## Project layout 
 
 - frontend/ — static web client for Vercel.
 - backend/ — FastAPI adapter for Render.
