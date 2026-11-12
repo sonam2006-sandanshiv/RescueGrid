@@ -2,7 +2,7 @@ const API_STORAGE_KEY = "rescuegrid-api-url";
 const form = document.querySelector("#analysis-form");
 const apiInput = document.querySelector("#api-url");
 const statusBox = document.querySelector("#status");
-const resultsBox = document.querySelector("#results");
+const resultsBox = document.querySelector("#results"); 
 const analyzeButton = document.querySelector("#analyze-button");
 const map = L.map("map", { scrollWheelZoom: true }).setView([27.95, 85.0], 7);
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
